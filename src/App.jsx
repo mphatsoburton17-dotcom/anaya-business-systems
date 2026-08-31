@@ -1832,10 +1832,10 @@ function Sidebar({ biz, category, tab, setTab, isOwner, isManager, canSee, unrea
    OVERVIEW
    ========================================================= */
 function Overview({ biz, category, isOwner, setTab }) {
+  const [statsPeriod, setStatsPeriod] = useState("today"); // today | week | month | all
+
   const branchOrders = filterByBranch(biz.orders, biz.settings?.activeBranchId);
-  const totalSales = branchOrders.reduce((s, o) => s + o.total, 0);
   const isTotalsMode = biz.profile?.recordingMode === "totals";
-  const avgSale = branchOrders.length ? Math.round(totalSales / branchOrders.length) : 0;
   const lowStock = category.hasStock
     ? biz.items.filter((i) => i.stock !== undefined && i.stock <= (i.lowStockAt ?? 3))
     : [];
@@ -1844,6 +1844,17 @@ function Overview({ biz, category, isOwner, setTab }) {
   const today = periodSummary(biz, new Date(now.getFullYear(), now.getMonth(), now.getDate()), new Date(now.getFullYear(), now.getMonth(), now.getDate(), 23, 59, 59, 999));
   const thisWeek = periodSummary(biz, startOfWeek(now), endOfWeek(now));
   const thisMonth = periodSummary(biz, new Date(now.getFullYear(), now.getMonth(), 1), new Date(now.getFullYear(), now.getMonth() + 1, 0, 23, 59, 59, 999));
+  const allTime = periodSummary(biz, new Date(0), new Date(now.getFullYear() + 50, 0, 1));
+
+  // Which period the top stat cards (revenue, orders, average sale) are scoped to —
+  // "Total revenue" was previously always all-time with no expenses subtracted and
+  // no indication of what date range it covered, which was confusing on its own.
+  const PERIOD_LABELS = { today: "Today", week: "This week", month: "This month", all: "All time" };
+  const PERIOD_DATA = { today, week: thisWeek, month: thisMonth, all: allTime };
+  const selected = PERIOD_DATA[statsPeriod];
+  const selectedOrderCount = selected.orders.length;
+  const avgSale = selectedOrderCount ? Math.round(selected.revenue / selectedOrderCount) : 0;
+  const netRevenue = selected.revenue - selected.spent;
 
   // last 7 days revenue vs expenses for the trend chart
   const days = Array.from({ length: 7 }).map((_, i) => {
@@ -1903,9 +1914,29 @@ function Overview({ biz, category, isOwner, setTab }) {
           <button style={styles.calloutLink} onClick={() => setTab("billing")}>View packages</button>
         </Callout>
       )}
+
+      {isOwner && (
+        <div style={styles.segmentedRow}>
+          {[["today", "Today"], ["week", "This week"], ["month", "This month"], ["all", "All time"]].map(([id, label]) => (
+            <button
+              key={id}
+              style={{ ...styles.segmentBtn, ...(statsPeriod === id ? styles.segmentBtnActive : {}) }}
+              onClick={() => setStatsPeriod(id)}
+            >
+              {label}
+            </button>
+          ))}
+        </div>
+      )}
+
       <div style={styles.statGrid} className="stat-grid">
-        <StatCard label="Total revenue" value={currency(totalSales)} icon={Wallet} tint="linear-gradient(135deg, #22A06B 0%, #146C43 100%)" />
-        <StatCard label={category.orderNounPlural} value={branchOrders.length} icon={Receipt} tint="linear-gradient(135deg, #2E6FE0 0%, #10399E 100%)" />
+        <StatCard
+          label={`Total revenue — ${PERIOD_LABELS[statsPeriod]}`}
+          value={currency(selected.revenue)}
+          sub={selected.spent > 0 ? `-${currency(selected.spent)} spent · Net ${currency(netRevenue)}` : undefined}
+          icon={Wallet} tint="linear-gradient(135deg, #22A06B 0%, #146C43 100%)"
+        />
+        <StatCard label={category.orderNounPlural} value={selectedOrderCount} icon={Receipt} tint="linear-gradient(135deg, #2E6FE0 0%, #10399E 100%)" />
         <StatCard label={category.itemLabelPlural} value={itemsForBranch(biz.items, biz.settings?.activeBranchId).length} icon={Package} tint="linear-gradient(135deg, #9D6FE8 0%, #6432B8 100%)" />
         {isTotalsMode
           ? <StatCard label="Average sale" value={currency(avgSale)} icon={Wallet} tint="linear-gradient(135deg, #E0A63A 0%, #A6690F 100%)" />
@@ -2035,7 +2066,7 @@ function Overview({ biz, category, isOwner, setTab }) {
   );
 }
 
-function StatCard({ label, value, icon: Icon, tint }) {
+function StatCard({ label, value, icon: Icon, tint, sub }) {
   if (Icon && tint) {
     return (
       <div className="lift-card" style={{ ...styles.statCardColored, background: tint }}>
@@ -2044,6 +2075,7 @@ function StatCard({ label, value, icon: Icon, tint }) {
         </div>
         <div style={styles.statCardColoredValue}>{value}</div>
         <div style={styles.statCardColoredLabel}>{label}</div>
+        {sub && <div style={{ ...styles.statCardColoredLabel, marginTop: 4, opacity: 0.92 }}>{sub}</div>}
       </div>
     );
   }
@@ -2051,6 +2083,7 @@ function StatCard({ label, value, icon: Icon, tint }) {
     <div style={styles.statCard}>
       <div style={styles.statValue}>{value}</div>
       <div style={styles.statLabel}>{label}</div>
+      {sub && <div style={{ ...styles.statLabel, marginTop: 4 }}>{sub}</div>}
     </div>
   );
 }
