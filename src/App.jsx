@@ -3598,6 +3598,8 @@ function ExpensesPanel({ biz, persist, setTab, currentEmployee }) {
   const [category, setCategory] = useState(EXPENSE_CATEGORIES[0]);
   const [amount, setAmount] = useState("");
   const [note, setNote] = useState("");
+  const [expenseDate, setExpenseDate] = useState(toDateInputValue(new Date()));
+  const today = new Date();
 
   const branchExpenses = filterByBranch(biz.expenses, biz.settings?.activeBranchId);
 
@@ -3608,9 +3610,10 @@ function ExpensesPanel({ biz, persist, setTab, currentEmployee }) {
   const addExpense = () => {
     if (isLocked) return;
     if (!amount || Number(amount) <= 0) return;
-    const exp = { id: uid("exp"), category, amount: Number(amount), note: note.trim(), branchId: biz.settings?.activeBranchId || biz.branches?.[0]?.id || null, ts: Date.now() };
+    const ts = new Date((expenseDate || toDateInputValue(new Date())) + "T12:00:00").getTime();
+    const exp = { id: uid("exp"), category, amount: Number(amount), note: note.trim(), branchId: biz.settings?.activeBranchId || biz.branches?.[0]?.id || null, ts };
     persist({ ...biz, expenses: [exp, ...biz.expenses] });
-    setAmount(""); setNote(""); setShowForm(false);
+    setAmount(""); setNote(""); setExpenseDate(toDateInputValue(new Date())); setShowForm(false);
   };
 
   const removeExpense = (id) => {
@@ -3656,6 +3659,10 @@ function ExpensesPanel({ biz, persist, setTab, currentEmployee }) {
           </select>
           <input style={styles.textInput} type="number" placeholder="Amount (MWK)"
             value={amount} onChange={(e) => setAmount(e.target.value)} />
+          <label style={styles.listRowSub}>Date</label>
+          <input style={{ ...styles.textInput, marginTop: 6 }} type="date" value={expenseDate} max={toDateInputValue(today)}
+            onChange={(e) => e.target.value && setExpenseDate(e.target.value)} />
+          <p style={styles.helperText}>Defaults to today — change this to log an expense from an earlier date.</p>
           <input style={styles.textInput} placeholder="Note (optional)"
             value={note} onChange={(e) => setNote(e.target.value)} />
           <button style={styles.primaryBtnSmall} onClick={addExpense}><Check size={16} /> Save expense</button>
