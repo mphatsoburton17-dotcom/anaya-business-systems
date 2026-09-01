@@ -160,6 +160,29 @@ const CATEGORIES = [
       { id: "repair_general", name: "Other Repair / Trade", icon: Wrench },
     ],
   },
+  {
+    id: "property",
+    name: "Property / Rentals",
+    icon: Building2,
+    examples: "Rental houses, shops, offices, land",
+    itemLabel: "Property",
+    itemLabelPlural: "Properties",
+    orderNoun: "Rent payment",
+    orderNounPlural: "Rent payments",
+    customerNoun: "Tenant",
+    customerNounPlural: "Tenants",
+    hasVariants: false,
+    hasStock: false,
+    extraFieldLabel: "Tenant name (leave blank if vacant)",
+    statusLabels: { pending: "Due", paid: "Paid", fulfilled: "Paid" },
+    theme: { accent: "#0E6E5C", accentSoft: "#E1F3EF", gold: "#0A5747", goldSoft: "#D8EFE9" },
+    heroStat: "occupiedProperties",
+    quickLabels: { newItem: "New property", newOrder: "Record rent payment", people: "Tenants" },
+    recentTitle: "Recent rent payments",
+    staffRoleLabel: "Property Manager",
+    suggestedCategories: ["Land", "House", "Apartment / Room", "Shop / Retail Space", "Office", "Warehouse", "Other"],
+    highVolumeExample: "an agent managing many rented units where itemizing every payment by hand gets tedious",
+  },
 ];
 
 // Matches a free-text business description to the closest category using keywords.
@@ -170,6 +193,7 @@ const CATEGORY_KEYWORDS = {
   service: ["salon", "barber", "barbershop", "spa", "nails", "massage", "appointment", "booking", "haircut", "beauty", "stylist", "consult", "consulting", "tutor", "tutoring", "gym", "fitness", "cleaning service", "photography", "makeup", "braiding"],
   food: ["restaurant", "café", "cafe", "food", "kitchen", "menu", "bakery", "bake", "drinks", "beverage", "takeaway", "take-away", "grill", "chips", "catering", "meals", "snacks", "coffee shop"],
   repair: ["repair", "fix", "fixing", "mechanic", "garage", "tailor", "tailoring", "sewing", "technician", "maintenance", "workshop", "carpentry", "plumber", "plumbing", "electrician", "welding", "phone repair"],
+  property: ["rent", "rental", "rentals", "landlord", "tenant", "tenants", "lease", "leasing", "property", "properties", "apartment", "apartments", "real estate", "estate agent", "letting", "house for rent", "office space", "warehouse"],
 };
 function suggestCategoryFromText(text) {
   const t = text.toLowerCase();
@@ -1981,6 +2005,19 @@ function Overview({ biz, category, isOwner, setTab }) {
     return { slices, total };
   })();
 
+  // Occupancy + overdue-rent tracking for Property/Rentals businesses. A property "item" carries
+  // the tenant name in `meta` (blank = vacant). A tenant is considered paid for the month if any
+  // itemized rent payment this month links back to their property's itemId — quick-total payments
+  // (no item selected) can't be tied to a specific property, so they don't clear an overdue flag.
+  const isPropertyBiz = category.id === "property";
+  const properties = itemsForBranch(biz.items, biz.settings?.activeBranchId);
+  const occupiedProperties = properties.filter((p) => p.meta);
+  const vacantProperties = properties.filter((p) => !p.meta);
+  const paidPropertyIdsThisMonth = new Set(
+    thisMonth.orders.flatMap((o) => (o.items || []).map((it) => it.itemId)).filter(Boolean)
+  );
+  const overdueProperties = occupiedProperties.filter((p) => !paidPropertyIdsThisMonth.has(p.id));
+
   return (
     <div style={styles.panel}>
       <SectionTitle title="Overview" />
@@ -2118,6 +2155,24 @@ function Overview({ biz, category, isOwner, setTab }) {
           {expiringSoon.length} item{expiringSoon.length > 1 ? "s" : ""} expiring within 30 days.
           <button style={styles.calloutLink} onClick={() => setTab("items")}>Review stock</button>
         </Callout>
+      )}
+
+      {isOwner && isPropertyBiz && (
+        <>
+          <SectionTitle title="Rent status" small />
+          <div style={styles.statGrid}>
+            <StatCard label="Occupied" value={occupiedProperties.length} />
+            <StatCard label="Vacant" value={vacantProperties.length} />
+            <StatCard label="Rent collected — this month" value={currency(thisMonth.revenue)} />
+            <StatCard label="Overdue tenants" value={overdueProperties.length} />
+          </div>
+          {overdueProperties.length > 0 && (
+            <Callout icon={AlertTriangle} tone="warn">
+              {overdueProperties.length} tenant{overdueProperties.length > 1 ? "s" : ""} without a rent payment logged this month (based on itemized rent payments — a "quick total" payment isn't linked to one property).
+              <button style={styles.calloutLink} onClick={() => setTab("items")}>Review properties</button>
+            </Callout>
+          )}
+        </>
       )}
 
       <div style={styles.quickRow}>
@@ -2370,7 +2425,7 @@ function ItemsPanel({ biz, category, persist, notify, isOwner }) {
           )}
 
           <div style={styles.formRow}>
-            <input style={styles.textInputHalf} type="number" placeholder={category.hasStock ? `Price per ${form.unit || "pcs"} (MWK)` : "Price (MWK)"}
+            <input style={styles.textInputHalf} type="number" placeholder={category.hasStock ? `Price per ${form.unit || "pcs"} (MWK)` : (category.id === "property" ? "Monthly rent (MWK)" : "Price (MWK)")}
               value={form.price} onChange={(e) => setForm({ ...form, price: e.target.value })} />
             <input style={styles.textInputHalf} type="number" placeholder={category.hasStock ? `Buying cost per ${form.unit || "pcs"} (optional)` : "Cost (optional)"}
               value={form.cost} onChange={(e) => setForm({ ...form, cost: e.target.value })} />
@@ -2386,7 +2441,7 @@ function ItemsPanel({ biz, category, persist, notify, isOwner }) {
             <input style={styles.textInput} type="number" step="any" placeholder={`Starting stock (${form.unit || "pcs"})`}
               value={form.stock} onChange={(e) => setForm({ ...form, stock: e.target.value })} />
           ) : (
-            <input style={styles.textInput} type="number" placeholder={category.extraFieldLabel}
+            <input style={styles.textInput} type={category.id === "property" ? "text" : "number"} placeholder={category.extraFieldLabel}
               value={form.meta} onChange={(e) => setForm({ ...form, meta: e.target.value })} />
           )}
 
@@ -2448,15 +2503,19 @@ function ItemsPanel({ biz, category, persist, notify, isOwner }) {
                 <div>
                   <div style={styles.listRowTitle}>{item.name}</div>
                   <div style={styles.listRowSub}>
-                    {currency(item.price)}{category.hasStock ? ` / ${item.unit || "pcs"}` : ""}
+                    {currency(item.price)}{category.hasStock ? ` / ${item.unit || "pcs"}` : (category.id === "property" ? "/month" : "")}
                     {category.hasStock && item.stock !== undefined && (
                       <span style={item.stock <= item.lowStockAt ? styles.lowStockText : undefined}>
                         {"  ·  "}{item.stock} {unitLabel(item.unit, item.stock !== 1)} in stock
                       </span>
                     )}
-                    {!category.hasStock && item.meta && (
+                    {category.id === "property" ? (
+                      <span style={!item.meta ? styles.lowStockText : undefined}>
+                        {"  ·  "}{item.meta ? `Tenant: ${item.meta}` : "Vacant"}
+                      </span>
+                    ) : (!category.hasStock && item.meta && (
                       <span>{"  ·  "}{item.meta} {category.id === "service" ? "min" : category.id === "repair" ? "hrs" : ""}</span>
-                    )}
+                    ))}
                     {item.category && <span>{"  ·  "}{item.category}</span>}
                     {item.cost > 0 && (
                       <span>{"  ·  "}Margin {currency(item.price - item.cost)}{category.hasStock ? `/${item.unit || "pcs"}` : ""}</span>
