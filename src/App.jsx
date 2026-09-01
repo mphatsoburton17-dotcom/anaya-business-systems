@@ -16,6 +16,16 @@ const EXPENSE_CATEGORIES = [
   "Damages / loss", "Repairs & maintenance", "Marketing",
   "Salaries & wages", "Staff loans / advances", "Other",
 ];
+// Property/Rentals businesses don't buy stock or pay themselves "rent" — their expenses
+// look more like the costs of maintaining and managing rented-out units.
+const PROPERTY_EXPENSE_CATEGORIES = [
+  "Property maintenance & repairs", "Utilities (paid by landlord)", "Property taxes / rates",
+  "Insurance", "Legal & agent fees", "Marketing",
+  "Salaries & wages", "Staff loans / advances", "Other",
+];
+function expenseCategoriesFor(categoryId) {
+  return categoryId === "property" ? PROPERTY_EXPENSE_CATEGORIES : EXPENSE_CATEGORIES;
+}
 
 // Units of measure for stocked items — for businesses that sell by weight/volume
 // (rice, cooking oil, fabric by the metre) rather than by the piece.
@@ -727,7 +737,7 @@ export default function App() {
           <ReportsPanel biz={biz} category={category} setTab={setTab} />
         )}
         {tab === "expenses" && (isOwner || isManager || hasModuleAccess(currentEmployee, "reports")) && (
-          <ExpensesPanel biz={biz} persist={persist} setTab={setTab} currentEmployee={currentEmployee} />
+          <ExpensesPanel biz={biz} category={category} persist={persist} setTab={setTab} currentEmployee={currentEmployee} />
         )}
         {tab === "activity" && (isOwner || isManager || hasModuleAccess(currentEmployee, "reports")) && (
           <ActivityPanel biz={biz} category={category} setTab={setTab} />
@@ -2425,10 +2435,12 @@ function ItemsPanel({ biz, category, persist, notify, isOwner }) {
           )}
 
           <div style={styles.formRow}>
-            <input style={styles.textInputHalf} type="number" placeholder={category.hasStock ? `Price per ${form.unit || "pcs"} (MWK)` : (category.id === "property" ? "Monthly rent (MWK)" : "Price (MWK)")}
+            <input style={{ ...styles.textInputHalf, ...(category.id === "property" ? { flex: 1 } : {}) }} type="number" placeholder={category.hasStock ? `Price per ${form.unit || "pcs"} (MWK)` : (category.id === "property" ? "Monthly rent (MWK)" : "Price (MWK)")}
               value={form.price} onChange={(e) => setForm({ ...form, price: e.target.value })} />
-            <input style={styles.textInputHalf} type="number" placeholder={category.hasStock ? `Buying cost per ${form.unit || "pcs"} (optional)` : "Cost (optional)"}
-              value={form.cost} onChange={(e) => setForm({ ...form, cost: e.target.value })} />
+            {category.id !== "property" && (
+              <input style={styles.textInputHalf} type="number" placeholder={category.hasStock ? `Buying cost per ${form.unit || "pcs"} (optional)` : "Cost (optional)"}
+                value={form.cost} onChange={(e) => setForm({ ...form, cost: e.target.value })} />
+            )}
           </div>
           {category.hasStock && Number(form.price) > 0 && Number(form.cost) > 0 && (
             <p style={{ ...styles.helperText, marginTop: -8 }}>
@@ -2460,24 +2472,28 @@ function ItemsPanel({ biz, category, persist, notify, isOwner }) {
             </>
           )}
 
-          <div style={styles.miniLabel}>Category (for "sales by category" in Reports)</div>
-          {bizCategories.length > 0 && (
-            <div style={{ display: "flex", flexWrap: "wrap", gap: 8, marginBottom: 10 }}>
-              {bizCategories.map((c) => (
-                <button key={c} type="button"
-                  style={{ ...styles.paymentChip, flex: "none", ...(form.itemCategory === c ? styles.paymentChipActive : {}) }}
-                  onClick={() => setForm({ ...form, itemCategory: form.itemCategory === c ? "" : c })}>
-                  {c}
-                </button>
-              ))}
-            </div>
+          {category.id !== "property" && (
+            <>
+              <div style={styles.miniLabel}>Category (for "sales by category" in Reports)</div>
+              {bizCategories.length > 0 && (
+                <div style={{ display: "flex", flexWrap: "wrap", gap: 8, marginBottom: 10 }}>
+                  {bizCategories.map((c) => (
+                    <button key={c} type="button"
+                      style={{ ...styles.paymentChip, flex: "none", ...(form.itemCategory === c ? styles.paymentChipActive : {}) }}
+                      onClick={() => setForm({ ...form, itemCategory: form.itemCategory === c ? "" : c })}>
+                      {c}
+                    </button>
+                  ))}
+                </div>
+              )}
+              <div style={{ display: "flex", gap: 8, marginBottom: 12 }}>
+                <input style={{ ...styles.textInput, marginBottom: 0 }} placeholder="New category…"
+                  value={newTag} onChange={(e) => setNewTag(e.target.value)}
+                  onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); addCategoryTag(); } }} />
+                <button type="button" style={styles.smallAddBtn} onClick={addCategoryTag}>Add</button>
+              </div>
+            </>
           )}
-          <div style={{ display: "flex", gap: 8, marginBottom: 12 }}>
-            <input style={{ ...styles.textInput, marginBottom: 0 }} placeholder="New category…"
-              value={newTag} onChange={(e) => setNewTag(e.target.value)}
-              onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); addCategoryTag(); } }} />
-            <button type="button" style={styles.smallAddBtn} onClick={addCategoryTag}>Add</button>
-          </div>
 
           <button style={styles.primaryBtnSmall} onClick={addItem}>
             <Check size={16} /> Save {category.itemLabel.toLowerCase()}
@@ -2839,22 +2855,25 @@ function OrdersPanel({ biz, category, persist, notify, currentEmployee }) {
           ) : (
             <>
               <div style={styles.formRow}>
-                <select style={styles.textInputHalf} value={selectedItemId} onChange={(e) => { setSelectedItemId(e.target.value); setQty(1); }}>
+                <select style={{ ...styles.textInputHalf, minWidth: 0 }} value={selectedItemId} onChange={(e) => { setSelectedItemId(e.target.value); setQty(1); }}>
                   <option value="">Select {category.itemLabel.toLowerCase()}…</option>
                   {itemsForBranch(biz.items, biz.settings?.activeBranchId).map((i) => (
                     <option key={i.id} value={i.id}>{i.name} — {currency(i.price)}{category.hasStock && i.unit && i.unit !== "pcs" ? `/${i.unit}` : ""}</option>
                   ))}
                 </select>
                 <input style={styles.qtyInput} type="number" min="0" step={selectedUnit !== "pcs" ? "any" : "1"}
-                  placeholder={selectedUnit !== "pcs" ? selectedUnit : ""} value={qty} onChange={(e) => setQty(e.target.value)} />
+                  placeholder={category.id === "property" ? "Months" : (selectedUnit !== "pcs" ? selectedUnit : "")} value={qty} onChange={(e) => setQty(e.target.value)} />
                 <button style={styles.smallAddBtn} onClick={addToCart}>Add</button>
               </div>
+              {category.id === "property" && (
+                <p style={{ ...styles.helperText, marginTop: -8 }}>Paying for more than one month at once? Set "Months" to 2, 3, or however many are being paid now.</p>
+              )}
 
               {cart.length > 0 && (
                 <div style={styles.cartBox}>
                   {cart.map((c, idx) => (
                     <div key={idx} style={styles.cartRow}>
-                      <span>{c.qty} {c.unit && c.unit !== "pcs" ? c.unit : "×"} {c.name}</span>
+                      <span>{category.id === "property" ? `${c.qty} month${c.qty !== 1 ? "s" : ""} — ${c.name}` : `${c.qty} ${c.unit && c.unit !== "pcs" ? c.unit : "×"} ${c.name}`}</span>
                       <span style={styles.mono}>{currency(c.price * c.qty)}</span>
                     </div>
                   ))}
@@ -3765,9 +3784,10 @@ function BranchesPanel({ biz, category, persist, setTab, currentEmployee }) {
 /* =========================================================
    EXPENSES (owner only)
    ========================================================= */
-function ExpensesPanel({ biz, persist, setTab, currentEmployee }) {
+function ExpensesPanel({ biz, category: bizCategory, persist, setTab, currentEmployee }) {
+  const expenseCategoryOptions = expenseCategoriesFor(bizCategory?.id);
   const [showForm, setShowForm] = useState(false);
-  const [category, setCategory] = useState(EXPENSE_CATEGORIES[0]);
+  const [category, setCategory] = useState(expenseCategoryOptions[0]);
   const [amount, setAmount] = useState("");
   const [note, setNote] = useState("");
   const [expenseDate, setExpenseDate] = useState(toDateInputValue(new Date()));
@@ -3821,13 +3841,13 @@ function ExpensesPanel({ biz, persist, setTab, currentEmployee }) {
 
       <div style={styles.statGrid}>
         <StatCard label="Spent this month" value={currency(totalThisMonth)} />
-        <StatCard label="Damages / loss" value={currency(damagesThisMonth)} />
+        {bizCategory?.id !== "property" && <StatCard label="Damages / loss" value={currency(damagesThisMonth)} />}
       </div>
 
       {showForm && !isLocked && (
         <div style={styles.formCard}>
           <select style={styles.textInput} value={category} onChange={(e) => setCategory(e.target.value)}>
-            {EXPENSE_CATEGORIES.map((c) => <option key={c} value={c}>{c}</option>)}
+            {expenseCategoryOptions.map((c) => <option key={c} value={c}>{c}</option>)}
           </select>
           <input style={styles.textInput} type="number" placeholder="Amount (MWK)"
             value={amount} onChange={(e) => setAmount(e.target.value)} />
@@ -4938,12 +4958,29 @@ We expect this matter to be addressed immediately. Please treat this as a seriou
 Regards,
 [Manager Name]
 ${biz.profile.name}` },
+  { id: "lease", label: "Lease / Rental agreement", forWhom: "customer",
+    body: (biz, tenant, extra, property) => `RENTAL AGREEMENT
+
+This agreement is made between ${biz.profile.name} ("the Landlord") and ${tenant?.name || "[Tenant Name]"} ("the Tenant").
+
+Property: ${property?.name || "[Property Name/Address]"}
+Monthly rent: ${property?.price ? currency(property.price) : "[Monthly Rent Amount]"}
+
+${extra || "The Tenant agrees to pay the monthly rent on or before the 1st of each month. The Tenant agrees to keep the property in good condition and report any damages promptly. Either party may terminate this agreement with 30 days' written notice."}
+
+Signed,
+
+_____________________          _____________________
+Landlord                        Tenant
+
+${biz.profile.name}` },
 ];
 
 function DocumentsPanel({ biz, category, persist, setTab, canEditBranding = true }) {
-  const [templateId, setTemplateId] = useState(LETTER_TEMPLATES[0].id);
+  const [templateId, setTemplateId] = useState(category?.id === "property" ? "lease" : LETTER_TEMPLATES[0].id);
   const template = LETTER_TEMPLATES.find((t) => t.id === templateId);
   const [personId, setPersonId] = useState("");
+  const [propertyId, setPropertyId] = useState("");
   const [extra, setExtra] = useState("");
   const [preview, setPreview] = useState(null);
   const [showBranding, setShowBranding] = useState(false);
@@ -4955,10 +4992,12 @@ function DocumentsPanel({ biz, category, persist, setTab, canEditBranding = true
   const [primaryColor, setPrimaryColor] = useState(branding.primaryColor || "#1449B0");
 
   const people = template.forWhom === "employee" ? biz.employees : biz.customers;
+  const isLeaseTemplate = templateId === "lease";
 
   const generate = () => {
     const person = people.find((p) => p.id === personId);
-    const text = template.body(biz, person, extra.trim());
+    const property = isLeaseTemplate ? biz.items.find((i) => i.id === propertyId) : null;
+    const text = template.body(biz, person, extra.trim(), property);
     const doc = { id: uid("doc"), templateId, templateLabel: template.label, personName: person?.name || "Unnamed", text, ts: Date.now() };
     persist({ ...biz, documents: [doc, ...biz.documents] });
     setPreview(doc);
@@ -5084,7 +5123,15 @@ function DocumentsPanel({ biz, category, persist, setTab, canEditBranding = true
           <option value="">Select {template.forWhom === "employee" ? "employee" : category.customerNoun.toLowerCase()}…</option>
           {people.map((p) => <option key={p.id} value={p.id}>{p.name}</option>)}
         </select>
-        <textarea style={styles.textArea} placeholder="Add specific details (optional) — reason, dates, performance notes…"
+        {isLeaseTemplate && (
+          <select style={styles.textInput} value={propertyId} onChange={(e) => setPropertyId(e.target.value)}>
+            <option value="">Select property…</option>
+            {itemsForBranch(biz.items, biz.settings?.activeBranchId).map((i) => (
+              <option key={i.id} value={i.id}>{i.name} — {currency(i.price)}/month</option>
+            ))}
+          </select>
+        )}
+        <textarea style={styles.textArea} placeholder={isLeaseTemplate ? "Add specific lease terms (optional) — deposit amount, lease length, house rules…" : "Add specific details (optional) — reason, dates, performance notes…"}
           value={extra} onChange={(e) => setExtra(e.target.value)} rows={3} />
         <button style={styles.primaryBtnSmall} onClick={generate}>
           <FileText size={16} /> Generate letter
