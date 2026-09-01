@@ -5,7 +5,8 @@ import {
   ChevronRight, LogOut, ShieldCheck, AlertTriangle, Trash2, MoreHorizontal,
   Moon, Sun, Calculator, FileText, Printer, TrendingDown, TrendingUp, Download, Search as SearchIcon,
   CalendarDays, Lock, Mail, BookOpen, Wallet, HandCoins, Puzzle, HelpCircle, Phone, MessageCircle,
-  Sparkles, Building2, Smartphone, Layers, Pencil, Share2
+  Sparkles, Building2, Smartphone, Layers, Pencil, Share2,
+  ShoppingCart, Shirt, Hammer, Sofa, Pill, Wheat, GraduationCap, UtensilsCrossed, Cookie, Beer, Car
 } from "lucide-react";
 import * as XLSX from "xlsx";
 import { supabase } from "./supabaseClient";
@@ -53,6 +54,18 @@ const CATEGORIES = [
     staffRoleLabel: "Sales Assistant",
     suggestedCategories: ["Clothing", "Cosmetics", "Electronics", "Groceries", "Household", "Other"],
     highVolumeExample: "a busy grocery or general dealer where dozens of customers pay at the till every hour",
+    subtypes: [
+      { id: "grocery", name: "Grocery / Supermarket", icon: ShoppingCart },
+      { id: "clothing", name: "Clothing & Fashion", icon: Shirt },
+      { id: "electronics", name: "Electronics & Phones", icon: Smartphone },
+      { id: "hardware", name: "Hardware & Building Supplies", icon: Hammer },
+      { id: "furniture", name: "Furniture", icon: Sofa },
+      { id: "pharmacy", name: "Pharmacy / Chemist", icon: Pill, isPharmacy: true },
+      { id: "agriculture", name: "Agriculture & Farm Produce", icon: Wheat },
+      { id: "cosmetics", name: "Cosmetics & Beauty Products", icon: Sparkles },
+      { id: "bookshop", name: "Book Shop", icon: BookOpen },
+      { id: "retail_general", name: "General Dealer / Other", icon: Store },
+    ],
   },
   {
     id: "service",
@@ -76,6 +89,14 @@ const CATEGORIES = [
     staffRoleLabel: "Stylist",
     suggestedCategories: ["Haircuts", "Braiding", "Nails & beauty", "Spa & massage", "Other"],
     highVolumeExample: "a walk-in barbershop or salon on a Saturday, where clients are handled back-to-back",
+    subtypes: [
+      { id: "salon", name: "Hair Salon", icon: Scissors },
+      { id: "barbershop", name: "Barbershop", icon: Scissors },
+      { id: "spa", name: "Spa & Massage", icon: Sparkles },
+      { id: "tutoring", name: "Tutoring / Consulting", icon: GraduationCap },
+      { id: "cleaning", name: "Cleaning Services", icon: Sparkles },
+      { id: "service_general", name: "Other Service", icon: Scissors },
+    ],
   },
   {
     id: "food",
@@ -99,6 +120,14 @@ const CATEGORIES = [
     staffRoleLabel: "Server",
     suggestedCategories: ["Drinks", "Mains", "Snacks", "Desserts", "Other"],
     highVolumeExample: "a café or takeaway during lunch rush, with a long line and no time to itemize every plate",
+    subtypes: [
+      { id: "restaurant", name: "Restaurant", icon: UtensilsCrossed },
+      { id: "cafe", name: "Café / Coffee Shop", icon: Coffee },
+      { id: "bakery", name: "Bakery", icon: Cookie },
+      { id: "takeaway", name: "Takeaway / Fast Food", icon: Package },
+      { id: "bar", name: "Bar / Pub", icon: Beer },
+      { id: "food_general", name: "Other Food & Beverage", icon: Coffee },
+    ],
   },
   {
     id: "repair",
@@ -122,6 +151,14 @@ const CATEGORIES = [
     staffRoleLabel: "Technician",
     suggestedCategories: ["Phone repair", "Tailoring", "Mechanical", "Electrical", "Other"],
     highVolumeExample: "a workshop with several small jobs coming in per hour that are hard to log one by one",
+    subtypes: [
+      { id: "phonerepair", name: "Phone & Electronics Repair", icon: Smartphone },
+      { id: "mechanic", name: "Mechanic / Auto Repair", icon: Car },
+      { id: "tailoring", name: "Tailoring & Alterations", icon: Scissors },
+      { id: "carpentry", name: "Carpentry", icon: Hammer },
+      { id: "plumbing", name: "Plumbing & Electrical", icon: Wrench },
+      { id: "repair_general", name: "Other Repair / Trade", icon: Wrench },
+    ],
   },
 ];
 
@@ -461,6 +498,8 @@ function emptyBusiness(name, categoryId, details = {}) {
       name, categoryId, createdAt: Date.now(),
       businessId: details.businessId || null,
       description: details.description || "",
+      businessSubtypeId: details.businessSubtypeId || null,
+      businessSubtypeName: details.businessSubtypeName || "",
       logoInitial: name?.[0]?.toUpperCase() || "A",
       phone: details.phone || "",
       location: details.location || "",
@@ -1229,6 +1268,7 @@ function Onboarding({ onCreate }) {
   const [step, setStep] = useState(0);
   const [name, setName] = useState("");
   const [categoryId, setCategoryId] = useState(null);
+  const [subtypeId, setSubtypeId] = useState(null);
   const [description, setDescription] = useState("");
   const [suggestion, setSuggestion] = useState(null); // { id, matched } | null | "none"
   const [ownerName, setOwnerName] = useState("");
@@ -1246,6 +1286,7 @@ function Onboarding({ onCreate }) {
 
   const TOTAL_STEPS = 7;
   const category = CATEGORIES.find((c) => c.id === categoryId);
+  const subtype = category?.subtypes?.find((s) => s.id === subtypeId) || null;
 
   const addTag = (raw) => {
     const clean = raw.trim();
@@ -1281,6 +1322,7 @@ function Onboarding({ onCreate }) {
         extraSeats: staffCount - 1, extraBranches: branchCount - 1,
         description: description.trim(), logo, primaryColor,
         recordingMode, categories: categoryTags,
+        businessSubtypeId: subtypeId, businessSubtypeName: subtype?.name || "",
       });
     } catch (err) {
       console.error("Setup failed", err);
@@ -1350,7 +1392,7 @@ function Onboarding({ onCreate }) {
             onClick={() => {
               const match = suggestCategoryFromText(description);
               setSuggestion(match || "none");
-              if (match) setCategoryId(match.id);
+              if (match) { setCategoryId(match.id); setSubtypeId(null); }
             }}
           >
             Suggest my setup
@@ -1374,7 +1416,7 @@ function Onboarding({ onCreate }) {
               return (
                 <button
                   key={c.id}
-                  onClick={() => { setCategoryId(c.id); setSuggestion(null); }}
+                  onClick={() => { setCategoryId(c.id); setSubtypeId(null); setSuggestion(null); }}
                   style={{
                     ...styles.categoryCard,
                     borderColor: active ? c.theme.accent : "var(--line)",
@@ -1391,11 +1433,41 @@ function Onboarding({ onCreate }) {
               );
             })}
           </div>
+
+          {category && category.subtypes?.length > 0 && (
+            <>
+              <div style={{ ...styles.listRowSub, marginTop: 4 }}>Which fits best? This is what shows on your dashboard and receipts.</div>
+              <div style={styles.categoryGrid}>
+                {category.subtypes.map((s) => {
+                  const Icon = s.icon;
+                  const active = subtypeId === s.id;
+                  return (
+                    <button
+                      key={s.id}
+                      onClick={() => setSubtypeId(s.id)}
+                      style={{
+                        ...styles.categoryCard,
+                        borderColor: active ? category.theme.accent : "var(--line)",
+                        background: active ? category.theme.accentSoft : "var(--surface)",
+                        boxShadow: active ? `0 6px 18px ${hexAlpha(category.theme.accent, 0.18)}` : styles.categoryCard.boxShadow,
+                      }}
+                    >
+                      <div style={{ ...styles.categoryIconWrap, background: active ? category.theme.accent : "var(--bg)" }}>
+                        <Icon size={20} color={active ? "#fff" : "var(--ink-soft)"} />
+                      </div>
+                      <div style={styles.categoryName}>{s.name}</div>
+                    </button>
+                  );
+                })}
+              </div>
+            </>
+          )}
+
           <div style={styles.stepNavRow}>
             <button style={styles.backTextBtn} onClick={() => setStep(0)}>Back</button>
             <button
-              style={{ ...styles.primaryBtnInline, opacity: categoryId ? 1 : 0.4 }}
-              disabled={!categoryId}
+              style={{ ...styles.primaryBtnInline, opacity: categoryId && subtypeId ? 1 : 0.4 }}
+              disabled={!categoryId || !subtypeId}
               onClick={() => setStep(2)}
             >
               Continue <ChevronRight size={18} />
@@ -1673,7 +1745,7 @@ function TopBar({ biz, category, currentEmployee, onSwitchRole, persist }) {
         )}
         <div>
           <div style={styles.bizName}>{biz.profile.name}</div>
-          <div style={styles.bizCategory}>{category.name}</div>
+          <div style={styles.bizCategory}>{biz.profile.businessSubtypeName || category.name}</div>
         </div>
       </div>
       <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
@@ -1798,7 +1870,7 @@ function Sidebar({ biz, category, tab, setTab, isOwner, isManager, canSee, unrea
         )}
         <div>
           <div style={styles.sidebarBizName}>{biz.profile.name}</div>
-          <div style={styles.sidebarBizCategory}>{category.name}</div>
+          <div style={styles.sidebarBizCategory}>{biz.profile.businessSubtypeName || category.name}</div>
         </div>
       </div>
       <div style={styles.sidebarScroll}>
@@ -1838,6 +1910,10 @@ function Overview({ biz, category, isOwner, setTab }) {
   const isTotalsMode = biz.profile?.recordingMode === "totals";
   const lowStock = category.hasStock
     ? biz.items.filter((i) => i.stock !== undefined && i.stock <= (i.lowStockAt ?? 3))
+    : [];
+  const isPharmacy = biz.profile?.businessSubtypeId === "pharmacy";
+  const expiringSoon = isPharmacy
+    ? biz.items.filter((i) => i.expiryDate && Math.ceil((new Date(i.expiryDate).getTime() - Date.now()) / 86400000) <= 30)
     : [];
 
   const now = new Date();
@@ -2037,6 +2113,13 @@ function Overview({ biz, category, isOwner, setTab }) {
         </Callout>
       )}
 
+      {isOwner && expiringSoon.length > 0 && (
+        <Callout icon={AlertTriangle} tone="warn">
+          {expiringSoon.length} item{expiringSoon.length > 1 ? "s" : ""} expiring within 30 days.
+          <button style={styles.calloutLink} onClick={() => setTab("items")}>Review stock</button>
+        </Callout>
+      )}
+
       <div style={styles.quickRow}>
         <QuickAction icon={Plus} label={category.quickLabels.newItem} onClick={() => setTab("items")} />
         <QuickAction icon={Receipt} label={category.quickLabels.newOrder} onClick={() => setTab("orders")} />
@@ -2163,8 +2246,9 @@ function SectionTitle({ title, small }) {
    ITEMS (Products / Services)
    ========================================================= */
 function ItemsPanel({ biz, category, persist, notify, isOwner }) {
+  const isPharmacy = biz.profile?.businessSubtypeId === "pharmacy";
   const [showForm, setShowForm] = useState(false);
-  const [form, setForm] = useState({ name: "", price: "", cost: "", stock: "", meta: "", itemCategory: "", unit: "pcs" });
+  const [form, setForm] = useState({ name: "", price: "", cost: "", stock: "", meta: "", itemCategory: "", unit: "pcs", expiryDate: "", batchNumber: "", requiresPrescription: false });
   const [query, setQuery] = useState("");
   const [newTag, setNewTag] = useState("");
   const [restockingId, setRestockingId] = useState(null); // item id currently showing the restock form
@@ -2193,10 +2277,13 @@ function ItemsPanel({ biz, category, persist, notify, isOwner }) {
       category: form.itemCategory.trim() || undefined,
       lowStockAt: 3,
       branchId: biz.settings?.activeBranchId || null,
+      expiryDate: isPharmacy && form.expiryDate ? form.expiryDate : undefined,
+      batchNumber: isPharmacy && form.batchNumber.trim() ? form.batchNumber.trim() : undefined,
+      requiresPrescription: isPharmacy ? !!form.requiresPrescription : undefined,
     };
     let next = { ...biz, items: [item, ...biz.items] };
     persist(next);
-    setForm({ name: "", price: "", cost: "", stock: "", meta: "", itemCategory: "", unit: "pcs" });
+    setForm({ name: "", price: "", cost: "", stock: "", meta: "", itemCategory: "", unit: "pcs", expiryDate: "", batchNumber: "", requiresPrescription: false });
     setShowForm(false);
   };
 
@@ -2303,6 +2390,21 @@ function ItemsPanel({ biz, category, persist, notify, isOwner }) {
               value={form.meta} onChange={(e) => setForm({ ...form, meta: e.target.value })} />
           )}
 
+          {isPharmacy && (
+            <>
+              <div style={styles.miniLabel}>Expiry date</div>
+              <input style={{ ...styles.textInput, marginTop: 6 }} type="date"
+                value={form.expiryDate} onChange={(e) => setForm({ ...form, expiryDate: e.target.value })} />
+              <input style={styles.textInput} placeholder="Batch / lot number (optional)"
+                value={form.batchNumber} onChange={(e) => setForm({ ...form, batchNumber: e.target.value })} />
+              <label style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 13, color: "var(--ink-faint)", marginBottom: 12, cursor: "pointer" }}>
+                <input type="checkbox" checked={form.requiresPrescription}
+                  onChange={(e) => setForm({ ...form, requiresPrescription: e.target.checked })} />
+                Requires a prescription reference at sale
+              </label>
+            </>
+          )}
+
           <div style={styles.miniLabel}>Category (for "sales by category" in Reports)</div>
           {bizCategories.length > 0 && (
             <div style={{ display: "flex", flexWrap: "wrap", gap: 8, marginBottom: 10 }}>
@@ -2359,6 +2461,17 @@ function ItemsPanel({ biz, category, persist, notify, isOwner }) {
                     {item.cost > 0 && (
                       <span>{"  ·  "}Margin {currency(item.price - item.cost)}{category.hasStock ? `/${item.unit || "pcs"}` : ""}</span>
                     )}
+                    {item.expiryDate && (() => {
+                      const daysLeft = Math.ceil((new Date(item.expiryDate).getTime() - Date.now()) / 86400000);
+                      const soon = daysLeft <= 30;
+                      return (
+                        <span style={soon ? styles.lowStockText : undefined}>
+                          {"  ·  "}{daysLeft < 0 ? "Expired" : `Expires ${new Date(item.expiryDate).toLocaleDateString()}`}
+                        </span>
+                      );
+                    })()}
+                    {item.batchNumber && <span>{"  ·  "}Batch {item.batchNumber}</span>}
+                    {item.requiresPrescription && <span>{"  ·  "}Rx required</span>}
                   </div>
                 </div>
                 <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
