@@ -1490,8 +1490,8 @@ function Onboarding({ onCreate }) {
           <div style={styles.stepNavRow}>
             <button style={styles.backTextBtn} onClick={() => setStep(0)}>Back</button>
             <button
-              style={{ ...styles.primaryBtnInline, opacity: categoryId && subtypeId ? 1 : 0.4 }}
-              disabled={!categoryId || !subtypeId}
+              style={{ ...styles.primaryBtnInline, opacity: categoryId && (!category?.subtypes?.length || subtypeId) ? 1 : 0.4 }}
+              disabled={!categoryId || (category?.subtypes?.length > 0 && !subtypeId)}
               onClick={() => setStep(2)}
             >
               Continue <ChevronRight size={18} />
