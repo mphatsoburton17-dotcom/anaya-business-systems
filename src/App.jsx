@@ -563,6 +563,75 @@ function emptyBusiness(name, categoryId, details = {}) {
   };
 }
 
+// ---------------- PayChangu payment flow ----------------
+// The actual API calls happen in Supabase Edge Functions (paychangu-initiate,
+// paychangu-verify) so the PayChangu secret key never reaches the browser.
+// This app only ever talks to those two functions, never to PayChangu directly.
+const PAYCHANGU_PENDING_KEY = "anaya:paychangu-pending";
+
+// Starts a PayChangu hosted checkout. Stashes the not-yet-saved order/rent-payment
+// locally (keyed by tx_ref) so it can be completed once the customer is redirected
+// back, then sends the browser to PayChangu's payment page.
+async function startPayChanguCheckout({ amount, customerName, businessName, description, pendingRecord }) {
+  const txRef = uid("pcg");
+  const cleanUrl = window.location.origin + window.location.pathname;
+  const returnUrl = `${cleanUrl}?tx_ref=${txRef}`;
+
+  const nameParts = (customerName || "Customer").trim().split(" ");
+  const firstName = nameParts[0] || "Customer";
+  const lastName = nameParts.slice(1).join(" ") || "";
+
+  const { data, error } = await supabase.functions.invoke("paychangu-initiate", {
+    body: {
+      amount, currency: "MWK", email: "customer@example.com",
+      first_name: firstName, last_name: lastName,
+      tx_ref: txRef, return_url: returnUrl,
+      title: businessName, description: description || "Payment",
+    },
+  });
+
+  if (error || !data?.checkout_url) {
+    return { ok: false, error: error?.message || "PayChangu didn't return a payment link. Please try again." };
+  }
+
+  try {
+    const pendingAll = JSON.parse(localStorage.getItem(PAYCHANGU_PENDING_KEY) || "{}");
+    pendingAll[txRef] = pendingRecord;
+    localStorage.setItem(PAYCHANGU_PENDING_KEY, JSON.stringify(pendingAll));
+  } catch { /* if localStorage is unavailable, verification after redirect just won't find a match */ }
+
+  window.location.href = data.checkout_url;
+  return { ok: true };
+}
+
+// Called once, after the app loads, if the URL has a ?tx_ref= from a PayChangu
+// redirect. Confirms with PayChangu (server-side, via the edge function) whether
+// the payment actually succeeded, then hands back the matching pending record.
+async function checkPayChanguReturn() {
+  const params = new URLSearchParams(window.location.search);
+  const txRef = params.get("tx_ref");
+  if (!txRef) return null;
+
+  // Clean the URL immediately so refreshing the page doesn't re-trigger this.
+  window.history.replaceState({}, "", window.location.origin + window.location.pathname);
+
+  let pendingRecord = null;
+  try {
+    const pendingAll = JSON.parse(localStorage.getItem(PAYCHANGU_PENDING_KEY) || "{}");
+    pendingRecord = pendingAll[txRef] || null;
+    if (pendingRecord) {
+      delete pendingAll[txRef];
+      localStorage.setItem(PAYCHANGU_PENDING_KEY, JSON.stringify(pendingAll));
+    }
+  } catch { /* no-op */ }
+
+  if (!pendingRecord) return null;
+
+  const { data, error } = await supabase.functions.invoke("paychangu-verify", { body: { tx_ref: txRef } });
+  const succeeded = !error && data?.status === "success";
+  return { succeeded, pendingRecord, status: data?.status || "error" };
+}
+
 export default function App() {
   const [loading, setLoading] = useState(true);
   const [biz, setBiz] = useState(null);
@@ -663,6 +732,50 @@ export default function App() {
     const n = { id: uid("note"), type, message, ts: Date.now(), read: false };
     return { ...biz_, notifications: [n, ...biz_.notifications].slice(0, 50) };
   }, []);
+
+  // After a PayChangu checkout redirect, the browser lands back here with
+  // ?tx_ref=... in the URL. Once `biz` is loaded, check whether that payment
+  // actually succeeded (verified server-side) and, if so, finish saving the
+  // order/rent-payment that was staged locally before the redirect away.
+  useEffect(() => {
+    if (!biz || !account) return;
+    let cancelled = false;
+    (async () => {
+      const result = await checkPayChanguReturn();
+      if (!result || cancelled) return;
+      const { succeeded, pendingRecord, status } = result;
+      if (succeeded && pendingRecord?.order) {
+        setBiz((current) => {
+          if (!current) return current;
+          let next = { ...current, orders: [pendingRecord.order, ...current.orders] };
+          if (pendingRecord.stockDeltas?.length) {
+            next = {
+              ...next,
+              items: next.items.map((it) => {
+                const delta = pendingRecord.stockDeltas.find((d) => d.itemId === it.id);
+                if (delta && it.stock !== undefined) return { ...it, stock: Math.max(0, it.stock - delta.qty) };
+                return it;
+              }),
+            };
+          }
+          if (pendingRecord.customerName) {
+            const nameLower = pendingRecord.customerName.trim().toLowerCase();
+            const existing = next.customers.find((c) => c.name.toLowerCase() === nameLower);
+            next = existing
+              ? { ...next, customers: next.customers.map((c) => c.id === existing.id ? { ...c, orders: c.orders + 1 } : c) }
+              : { ...next, customers: [{ id: uid("cust"), name: pendingRecord.customerName.trim(), orders: 1 }, ...next.customers] };
+          }
+          next = notify(next, "payment", `PayChangu payment of ${currency(pendingRecord.order.total)} confirmed${pendingRecord.customerName ? " from " + pendingRecord.customerName : ""}`);
+          persistBizForUser(account.userId, next);
+          return next;
+        });
+        alert(`Payment confirmed — ${currency(pendingRecord.order.total)} received via PayChangu.`);
+      } else if (pendingRecord) {
+        alert(`PayChangu payment was not completed (status: ${status}). Nothing was recorded — you can try again.`);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [biz, account, notify]);
 
   if (loading) {
     return (
@@ -2729,6 +2842,25 @@ function OrdersPanel({ biz, category, persist, notify, currentEmployee }) {
       branchId: existingOrder?.branchId || (biz.settings?.activeBranchId || biz.branches?.[0]?.id || null),
       ts,
     };
+
+    // PayChangu on a brand-new (not edited) sale: send the customer to PayChangu's
+    // checkout instead of marking this paid right away. The order only gets saved
+    // once payment is confirmed, after the redirect back — see checkPayChanguReturn
+    // in the main App component.
+    if (paymentMethod === "PayChangu" && !isEditing) {
+      const stockDeltas = (category.hasStock && !isQuick) ? cart.map((c) => ({ itemId: c.itemId, qty: c.qty })) : [];
+      startPayChanguCheckout({
+        amount: order.total,
+        customerName: order.customerName,
+        businessName: biz.profile.name,
+        description: `${category.orderNoun} — ${order.customerName || "walk-in"}`,
+        pendingRecord: { order, stockDeltas, customerName: order.customerName },
+      }).then((result) => {
+        if (!result.ok) alert(result.error);
+      });
+      return;
+    }
+
     let next = { ...biz };
 
     if (isEditing) {
