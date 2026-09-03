@@ -744,7 +744,28 @@ export default function App() {
       const result = await checkPayChanguReturn();
       if (!result || cancelled) return;
       const { succeeded, pendingRecord, status } = result;
-      if (succeeded && pendingRecord?.order) {
+      if (succeeded && pendingRecord?.type === "billing") {
+        setBiz((current) => {
+          if (!current) return current;
+          const req = pendingRecord.requested;
+          let next = {
+            ...current,
+            profile: {
+              ...current.profile,
+              extraSeats: req.extraSeats, extraBranches: req.extraBranches,
+              packages: { ...current.profile.packages, ...req.packages },
+            },
+            billingRequests: [
+              { id: uid("billreq"), ts: Date.now(), status: "confirmed", confirmedAt: Date.now(), requested: req, total: pendingRecord.total, note: "Paid via PayChangu" },
+              ...(current.billingRequests || []),
+            ],
+          };
+          next = notify(next, "payment", `Plan updated via PayChangu — now ${currency(pendingRecord.total)}/month`);
+          persistBizForUser(account.userId, next);
+          return next;
+        });
+        alert(`Payment confirmed — your plan has been updated to ${currency(pendingRecord.total)}/month.`);
+      } else if (succeeded && pendingRecord?.order) {
         setBiz((current) => {
           if (!current) return current;
           let next = { ...current, orders: [pendingRecord.order, ...current.orders] };
@@ -2854,7 +2875,7 @@ function OrdersPanel({ biz, category, persist, notify, currentEmployee }) {
         customerName: order.customerName,
         businessName: biz.profile.name,
         description: `${category.orderNoun} — ${order.customerName || "walk-in"}`,
-        pendingRecord: { order, stockDeltas, customerName: order.customerName },
+        pendingRecord: { type: "order", order, stockDeltas, customerName: order.customerName },
       }).then((result) => {
         if (!result.ok) alert(result.error);
       });
@@ -4768,6 +4789,23 @@ function BillingPanel({ biz, persist, setTab }) {
     setNote(""); setScreenshot(null); setShowRequestForm(false);
   };
 
+  const [payingViaPayChangu, setPayingViaPayChangu] = useState(false);
+  const payWithPayChangu = async () => {
+    setPayingViaPayChangu(true);
+    const description = `Plan — ${reqSeats} staff login(s), ${reqBranches} branch(es)${Object.values(PACKAGES).filter((p) => reqPackages[p.id]).map((p) => `, ${p.name}`).join("")}`;
+    const result = await startPayChanguCheckout({
+      amount: requestedTotal,
+      businessName: biz.profile.name,
+      description,
+      pendingRecord: {
+        type: "billing",
+        requested: { extraSeats: reqSeats - 1, extraBranches: reqBranches - 1, packages: { ...reqPackages } },
+        total: requestedTotal,
+      },
+    });
+    if (!result.ok) { alert(result.error); setPayingViaPayChangu(false); }
+  };
+
   // Once Anaya has actually confirmed your payment (by WhatsApp, call, etc.), come back here
   // and switch it on — there's no shared server yet to verify this automatically.
   const confirmRequest = (req) => {
@@ -4845,22 +4883,28 @@ function BillingPanel({ biz, persist, setTab }) {
 
           {hasChange && (
             <>
-              <div style={{ ...styles.staffFormSectionLabel, marginTop: 14 }}>Send payment to</div>
+              <div style={{ ...styles.staffFormSectionLabel, marginTop: 14 }}>Pay for this plan</div>
+              <button style={{ ...styles.primaryBtnSmall, opacity: payingViaPayChangu ? 0.6 : 1 }} disabled={payingViaPayChangu} onClick={payWithPayChangu}>
+                <Wallet size={16} /> {payingViaPayChangu ? "Opening PayChangu…" : `Pay ${currency(requestedTotal)} with PayChangu`}
+              </button>
+              <p style={styles.helperText}>You'll be sent to PayChangu to complete payment — your plan updates automatically the moment it's confirmed, no waiting on manual approval.</p>
+
+              <div style={{ ...styles.staffFormSectionLabel, marginTop: 14 }}>Or pay manually</div>
               <div style={styles.listRowSub}>Bank: {ANAYA_PAYMENT_INFO.bankName} · {ANAYA_PAYMENT_INFO.accountName} · {ANAYA_PAYMENT_INFO.accountNumber}</div>
               <div style={styles.listRowSub}>Airtel Money: {ANAYA_PAYMENT_INFO.airtelMoneyNumber}</div>
               <div style={styles.listRowSub}>TNM Mpamba: {ANAYA_PAYMENT_INFO.tnmMpambaNumber}</div>
 
               <div style={{ ...styles.staffFormSectionLabel, marginTop: 14 }}>Proof of payment</div>
-              <p style={styles.helperText}>Attach a screenshot of the transfer, then send it to Anaya on WhatsApp so it can actually be checked — this app doesn't have a shared server yet, so a screenshot saved only here can't be seen from our side.</p>
+              <p style={styles.helperText}>Attach a screenshot of the transfer, then send it to Anaya on WhatsApp so it can actually be checked — this is the slower, manual route; PayChangu above confirms instantly.</p>
               <input type="file" accept="image/*" onChange={onScreenshotFile} />
               {screenshot && <img src={screenshot} alt="Payment proof" style={{ maxWidth: "100%", borderRadius: 10, marginTop: 8 }} />}
               <input style={styles.textInput} placeholder="Note (optional) — e.g. paid via Airtel Money at 3pm" value={note} onChange={(e) => setNote(e.target.value)} />
 
-              <a href={whatsappHref()} target="_blank" rel="noreferrer" style={{ ...styles.primaryBtnSmall, textDecoration: "none", justifyContent: "center", marginTop: 8 }}>
+              <a href={whatsappHref()} target="_blank" rel="noreferrer" style={{ ...styles.primaryBtnSmall, textDecoration: "none", justifyContent: "center", marginTop: 8, background: "none", border: "1px solid var(--line)", color: "var(--ink)" }}>
                 <MessageCircle size={16} /> Message Anaya on WhatsApp
               </a>
-              <button style={{ ...styles.primaryBtnSmall, opacity: screenshot ? 1 : 0.5, marginTop: 8 }} disabled={!screenshot} onClick={submitRequest}>
-                <Check size={16} /> Submit request
+              <button style={{ ...styles.primaryBtnSmall, opacity: screenshot ? 1 : 0.5, marginTop: 8, background: "none", border: "1px solid var(--line)", color: "var(--ink)" }} disabled={!screenshot} onClick={submitRequest}>
+                <Check size={16} /> Submit manual request
               </button>
             </>
           )}
