@@ -353,18 +353,6 @@ const PACKAGES = {
     desc: "Marketing tools (flyers, broadcasts, content calendar) and auto-generated documents.",
   },
 };
-// Where a business sends money to pay for Anaya itself (not a payment gateway — just your own
-// receiving details). Edit these to your real ones before going live. Businesses attach a
-// screenshot of their transfer as proof, then confirm with you directly (e.g. on WhatsApp)
-// before switching their request to active — there's no shared server here to auto-verify it.
-const ANAYA_PAYMENT_INFO = {
-  bankName: "Standard Bank",
-  accountName: "Mphatso Burton",
-  accountNumber: "9100007700099",
-  airtelMoneyNumber: "0991896521",
-  tnmMpambaNumber: "0880140865",
-  whatsapp: "0991896521",
-};
 function daysSince(ts) {
   return (Date.now() - (ts || 0)) / 86400000;
 }
@@ -506,6 +494,43 @@ async function generateBusinessIdRemote() {
   return `ANA-${Date.now().toString().slice(-6)}`;
 }
 
+// ---------------- multi-business accounts ----------------
+const ADDITIONAL_BUSINESS_PRICE = 15000; // MWK / month for each extra business under one login
+
+// Every business a given login has access to (the one they signed up with,
+// plus any additional ones added via the flow below).
+async function fetchMyBusinesses(userId) {
+  const { data, error } = await supabase
+    .from("user_businesses")
+    .select("business_id, role, businesses(id, business_id, name, category_id)")
+    .eq("user_id", userId);
+  if (error || !data) return [];
+  return data
+    .filter((row) => row.businesses)
+    .map((row) => ({
+      uuid: row.businesses.id,
+      shortId: row.businesses.business_id,
+      name: row.businesses.name,
+      categoryId: row.businesses.category_id,
+      role: row.role,
+    }));
+}
+// Moves the "active" business pointer for this login to a different one
+// they already have access to.
+async function switchActiveBusinessRemote(businessUuid) {
+  const { error } = await supabase.rpc("switch_active_business", { p_business_uuid: businessUuid });
+  return { ok: !error, error: error?.message };
+}
+// Creates a brand-new business under an already-logged-in account (called
+// only after PayChangu confirms payment — see the completion handler below).
+async function createAdditionalBusinessRemote(shortId, name, categoryId) {
+  const { data, error } = await supabase.rpc("create_additional_business", {
+    p_business_id: shortId, p_name: name, p_category_id: categoryId,
+  });
+  if (error) return { error: error.message };
+  return { businessUuid: data };
+}
+
 // Every business's very first account is created with role "owner" and pin "0000" (see emptyBusiness
 // below), and pin is never touched by the staff-edit form. If something ever leaves the business with
 // no "owner" anymore (e.g. an older version of the app let that account's own access level be edited),
@@ -639,11 +664,15 @@ export default function App() {
   const [authMode, setAuthMode] = useState("landing"); // landing | login | register
   const [session, setSession] = useState(null); // employee id currently "logged in"
   const [tab, setTab] = useState("overview");
+  const [myBusinesses, setMyBusinesses] = useState([]); // every business this login can access
+  const [switchingBusiness, setSwitchingBusiness] = useState(false);
 
-  const loadFromSession = useCallback(async (authSession) => {
-    if (!authSession) { setBiz(null); setAccount(null); setSession(null); return; }
-    const biz_ = await fetchBizForUser(authSession.user.id);
-    if (!biz_) { setBiz(null); setAccount(null); setSession(null); return; }
+  // Loads whichever business is currently "active" (profiles.business_id) for
+  // this login, and applies the same migration/repair steps every time —
+  // used on first sign-in, and again after switching to a different business.
+  const loadActiveBiz = useCallback(async (userId) => {
+    const biz_ = await fetchBizForUser(userId);
+    if (!biz_) return null;
     const legacyBranchId = uid("branch");
     const branches = biz_.branches && biz_.branches.length > 0
       ? biz_.branches
@@ -668,11 +697,31 @@ export default function App() {
         branding: { logo: null, primaryColor: "", secondaryColor: "", address: biz_.profile?.location || "", signature: null, ...biz_.profile?.branding },
       },
     });
+    if (JSON.stringify(migrated) !== JSON.stringify(biz_)) persistBizForUser(userId, migrated);
+    return migrated;
+  }, []);
+
+  const loadFromSession = useCallback(async (authSession) => {
+    if (!authSession) { setBiz(null); setAccount(null); setSession(null); setMyBusinesses([]); return; }
+    const migrated = await loadActiveBiz(authSession.user.id);
+    if (!migrated) { setBiz(null); setAccount(null); setSession(null); setMyBusinesses([]); return; }
     setBiz(migrated);
     setAccount({ email: authSession.user.email, userId: authSession.user.id });
     setSession(migrated.employees[0]?.id || null);
-    if (JSON.stringify(migrated) !== JSON.stringify(biz_)) persistBizForUser(authSession.user.id, migrated);
-  }, []);
+    fetchMyBusinesses(authSession.user.id).then(setMyBusinesses);
+  }, [loadActiveBiz]);
+
+  // Switches to a different business this login already has access to, then
+  // reloads the dashboard scoped to it. Used by the business switcher.
+  const switchBusiness = useCallback(async (businessUuid) => {
+    if (!account?.userId) return;
+    setSwitchingBusiness(true);
+    const result = await switchActiveBusinessRemote(businessUuid);
+    if (!result.ok) { alert(result.error || "Couldn't switch businesses."); setSwitchingBusiness(false); return; }
+    const migrated = await loadActiveBiz(account.userId);
+    if (migrated) { setBiz(migrated); setSession(migrated.employees[0]?.id || null); setTab("overview"); }
+    setSwitchingBusiness(false);
+  }, [account, loadActiveBiz]);
 
   useEffect(() => {
     let active = true;
@@ -744,7 +793,21 @@ export default function App() {
       const result = await checkPayChanguReturn();
       if (!result || cancelled) return;
       const { succeeded, pendingRecord, status } = result;
-      if (succeeded && pendingRecord?.type === "billing") {
+      if (succeeded && pendingRecord?.type === "new-business") {
+        const created = await createAdditionalBusinessRemote(pendingRecord.shortId, pendingRecord.name, pendingRecord.categoryId);
+        if (created.error) {
+          alert(`Payment succeeded, but creating the business failed: ${created.error}. Please contact support — your payment went through.`);
+        } else {
+          const list = await fetchMyBusinesses(account.userId);
+          setMyBusinesses(list);
+          const switched = await switchActiveBusinessRemote(created.businessUuid);
+          if (switched.ok) {
+            const migrated = await loadActiveBiz(account.userId);
+            if (migrated) { setBiz(migrated); setSession(migrated.employees[0]?.id || null); setTab("overview"); }
+          }
+          alert(`"${pendingRecord.name}" has been created and is ready to set up.`);
+        }
+      } else if (succeeded && pendingRecord?.type === "billing") {
         setBiz((current) => {
           if (!current) return current;
           const req = pendingRecord.requested;
@@ -796,7 +859,7 @@ export default function App() {
       }
     })();
     return () => { cancelled = true; };
-  }, [biz, account, notify]);
+  }, [biz, account, notify, loadActiveBiz]);
 
   if (loading) {
     return (
@@ -896,6 +959,9 @@ export default function App() {
         )}
         {tab === "billing" && isOwner && (
           <BillingPanel biz={biz} persist={persist} setTab={setTab} />
+        )}
+        {tab === "businesses" && isOwner && (
+          <BusinessesPanel myBusinesses={myBusinesses} biz={biz} switchBusiness={switchBusiness} switchingBusiness={switchingBusiness} setTab={setTab} />
         )}
         {tab === "calculator" && (
           <CalculatorPanel biz={biz} persist={persist} setTab={setTab} />
@@ -2021,6 +2087,7 @@ function Sidebar({ biz, category, tab, setTab, isOwner, isManager, canSee, unrea
       title: "Business",
       rows: [
         { id: "billing", label: "Packages & billing", icon: Wallet, show: isOwner },
+        { id: "businesses", label: "Businesses", icon: Building2, show: isOwner },
         { id: "integrations", label: "Integrations", icon: Puzzle, show: isOwner },
         { id: "settings", label: "Settings", icon: Settings, show: isOwner },
         { id: "help", label: "Help", icon: HelpCircle, show: true },
@@ -4749,13 +4816,11 @@ function BillingPanel({ biz, persist, setTab }) {
   const currentTotal = BASE_PLAN_PRICE + seatAddonCost(extraSeats) + branchAddonCost(extraBranches)
     + Object.values(PACKAGES).reduce((s, p) => s + (activePackages[p.id] ? p.price : 0), 0);
 
-  // Requesting a change is staged locally first — nothing is switched on until a request is
-  // submitted with proof of payment, and then confirmed. No self-activation anymore.
+  // Requesting a change is staged locally first — nothing switches on until PayChangu
+  // confirms the payment (see the PayChangu completion handler in the main App component).
   const [reqSeats, setReqSeats] = useState(1 + extraSeats);
   const [reqBranches, setReqBranches] = useState(1 + extraBranches);
   const [reqPackages, setReqPackages] = useState({ ...activePackages });
-  const [screenshot, setScreenshot] = useState(null);
-  const [note, setNote] = useState("");
   const [showRequestForm, setShowRequestForm] = useState(false);
 
   const requestedTotal = BASE_PLAN_PRICE + seatAddonCost(reqSeats - 1) + branchAddonCost(reqBranches - 1)
@@ -4764,30 +4829,6 @@ function BillingPanel({ biz, persist, setTab }) {
     || Object.values(PACKAGES).some((p) => !!reqPackages[p.id] !== !!activePackages[p.id]);
 
   const toggleReqPackage = (id) => setReqPackages((p) => ({ ...p, [id]: !p[id] }));
-
-  const onScreenshotFile = async (e) => {
-    const file = e.target.files?.[0];
-    if (!file) return;
-    const raw = await fileToDataUrl(file);
-    setScreenshot(await resizeDataUrl(raw, 800));
-  };
-
-  const whatsappHref = () => {
-    const text = `Hi Anaya, I'd like to pay for a plan change.\nBusiness: ${biz.profile.name} (${biz.profile.businessId || "no ID yet"})\nRequesting: ${reqSeats} staff login(s), ${reqBranches} branch(es)${Object.values(PACKAGES).filter((p) => reqPackages[p.id]).map((p) => `, ${p.name}`).join("")}\nNew total: ${currency(requestedTotal)}/month\n(Attaching my payment screenshot separately.)`;
-    const digits = (ANAYA_PAYMENT_INFO.whatsapp || "").replace(/[^\d]/g, "");
-    return `https://wa.me/${digits}?text=${encodeURIComponent(text)}`;
-  };
-
-  const submitRequest = () => {
-    if (!screenshot) return;
-    const request = {
-      id: uid("billreq"), ts: Date.now(), status: "pending",
-      requested: { extraSeats: reqSeats - 1, extraBranches: reqBranches - 1, packages: { ...reqPackages } },
-      total: requestedTotal, note: note.trim(), screenshot,
-    };
-    persist({ ...biz, billingRequests: [request, ...(biz.billingRequests || [])] });
-    setNote(""); setScreenshot(null); setShowRequestForm(false);
-  };
 
   const [payingViaPayChangu, setPayingViaPayChangu] = useState(false);
   const payWithPayChangu = async () => {
@@ -4806,22 +4847,7 @@ function BillingPanel({ biz, persist, setTab }) {
     if (!result.ok) { alert(result.error); setPayingViaPayChangu(false); }
   };
 
-  // Once Anaya has actually confirmed your payment (by WhatsApp, call, etc.), come back here
-  // and switch it on — there's no shared server yet to verify this automatically.
-  const confirmRequest = (req) => {
-    persist({
-      ...biz,
-      profile: { ...biz.profile, extraSeats: req.requested.extraSeats, extraBranches: req.requested.extraBranches, packages: { ...biz.profile.packages, ...req.requested.packages } },
-      billingRequests: biz.billingRequests.map((r) => r.id === req.id ? { ...r, status: "confirmed", confirmedAt: Date.now() } : r),
-    });
-  };
-
-  const cancelRequest = (id) => {
-    persist({ ...biz, billingRequests: biz.billingRequests.filter((r) => r.id !== id) });
-  };
-
-  const pendingRequests = (biz.billingRequests || []).filter((r) => r.status === "pending");
-  const pastRequests = (biz.billingRequests || []).filter((r) => r.status !== "pending");
+  const pastRequests = biz.billingRequests || [];
 
   return (
     <div style={styles.panel}>
@@ -4883,55 +4909,14 @@ function BillingPanel({ biz, persist, setTab }) {
 
           {hasChange && (
             <>
-              <div style={{ ...styles.staffFormSectionLabel, marginTop: 14 }}>Pay for this plan</div>
-              <button style={{ ...styles.primaryBtnSmall, opacity: payingViaPayChangu ? 0.6 : 1 }} disabled={payingViaPayChangu} onClick={payWithPayChangu}>
+              <button style={{ ...styles.primaryBtnSmall, opacity: payingViaPayChangu ? 0.6 : 1, marginTop: 4 }} disabled={payingViaPayChangu} onClick={payWithPayChangu}>
                 <Wallet size={16} /> {payingViaPayChangu ? "Opening PayChangu…" : `Pay ${currency(requestedTotal)} with PayChangu`}
               </button>
-              <p style={styles.helperText}>You'll be sent to PayChangu to complete payment — your plan updates automatically the moment it's confirmed, no waiting on manual approval.</p>
-
-              <div style={{ ...styles.staffFormSectionLabel, marginTop: 14 }}>Or pay manually</div>
-              <div style={styles.listRowSub}>Bank: {ANAYA_PAYMENT_INFO.bankName} · {ANAYA_PAYMENT_INFO.accountName} · {ANAYA_PAYMENT_INFO.accountNumber}</div>
-              <div style={styles.listRowSub}>Airtel Money: {ANAYA_PAYMENT_INFO.airtelMoneyNumber}</div>
-              <div style={styles.listRowSub}>TNM Mpamba: {ANAYA_PAYMENT_INFO.tnmMpambaNumber}</div>
-
-              <div style={{ ...styles.staffFormSectionLabel, marginTop: 14 }}>Proof of payment</div>
-              <p style={styles.helperText}>Attach a screenshot of the transfer, then send it to Anaya on WhatsApp so it can actually be checked — this is the slower, manual route; PayChangu above confirms instantly.</p>
-              <input type="file" accept="image/*" onChange={onScreenshotFile} />
-              {screenshot && <img src={screenshot} alt="Payment proof" style={{ maxWidth: "100%", borderRadius: 10, marginTop: 8 }} />}
-              <input style={styles.textInput} placeholder="Note (optional) — e.g. paid via Airtel Money at 3pm" value={note} onChange={(e) => setNote(e.target.value)} />
-
-              <a href={whatsappHref()} target="_blank" rel="noreferrer" style={{ ...styles.primaryBtnSmall, textDecoration: "none", justifyContent: "center", marginTop: 8, background: "none", border: "1px solid var(--line)", color: "var(--ink)" }}>
-                <MessageCircle size={16} /> Message Anaya on WhatsApp
-              </a>
-              <button style={{ ...styles.primaryBtnSmall, opacity: screenshot ? 1 : 0.5, marginTop: 8, background: "none", border: "1px solid var(--line)", color: "var(--ink)" }} disabled={!screenshot} onClick={submitRequest}>
-                <Check size={16} /> Submit manual request
-              </button>
+              <p style={styles.helperText}>You'll be sent to PayChangu to complete payment — your plan updates automatically the moment it's confirmed.</p>
             </>
           )}
           <button style={styles.logoutBtn} onClick={() => setShowRequestForm(false)}><X size={15} /> Cancel</button>
         </div>
-      )}
-
-      {pendingRequests.length > 0 && (
-        <>
-          <SectionTitle title="Pending" small />
-          <div style={styles.list}>
-            {pendingRequests.map((r) => (
-              <div key={r.id} style={styles.formCard}>
-                <div style={styles.listRowTitle}>{currency(r.total)}/month requested</div>
-                <div style={styles.listRowSub}>
-                  {1 + r.requested.extraSeats} login{r.requested.extraSeats !== 0 ? "s" : ""} · {1 + r.requested.extraBranches} branch{r.requested.extraBranches !== 0 ? "es" : ""}
-                  {Object.values(PACKAGES).filter((p) => r.requested.packages[p.id]).map((p) => ` · ${p.name}`).join("")}
-                </div>
-                {r.note && <div style={styles.listRowSub}>Note: {r.note}</div>}
-                <img src={r.screenshot} alt="Payment proof" style={{ maxWidth: "100%", borderRadius: 10, margin: "8px 0" }} />
-                <p style={styles.helperText}>Once Anaya has confirmed your payment (WhatsApp, call, etc.), tap below to switch it on.</p>
-                <button style={styles.primaryBtnSmall} onClick={() => confirmRequest(r)}><Check size={16} /> Anaya confirmed — activate now</button>
-                <button style={styles.logoutBtn} onClick={() => cancelRequest(r.id)}><X size={15} /> Cancel request</button>
-              </div>
-            ))}
-          </div>
-        </>
       )}
 
       {pastRequests.length > 0 && (
@@ -4950,7 +4935,77 @@ function BillingPanel({ biz, persist, setTab }) {
         </>
       )}
 
-      <p style={styles.helperText}>This is a manual, honesty-based flow for now — everything stays in your own device's storage. A shared backend to verify payments automatically is a good next step once the business grows.</p>
+      <p style={styles.helperText}>Payments are confirmed automatically through PayChangu — no waiting on manual approval.</p>
+    </div>
+  );
+}
+
+/* =========================================================
+   BUSINESSES (multi-business accounts — owner only)
+   ========================================================= */
+function BusinessesPanel({ myBusinesses, biz, switchBusiness, switchingBusiness, setTab }) {
+  const [showAddForm, setShowAddForm] = useState(false);
+  const [newName, setNewName] = useState("");
+  const [newCategoryId, setNewCategoryId] = useState(CATEGORIES[0].id);
+  const [creating, setCreating] = useState(false);
+
+  const startAddBusiness = async () => {
+    if (!newName.trim() || !newCategoryId) return;
+    setCreating(true);
+    const shortId = await generateBusinessIdRemote();
+    const result = await startPayChanguCheckout({
+      amount: ADDITIONAL_BUSINESS_PRICE,
+      businessName: newName.trim(),
+      description: `New business — ${newName.trim()}`,
+      pendingRecord: { type: "new-business", shortId, name: newName.trim(), categoryId: newCategoryId },
+    });
+    if (!result.ok) { alert(result.error); setCreating(false); }
+  };
+
+  return (
+    <div style={styles.panel}>
+      <BackRow onBack={() => setTab("more")} label="More" />
+      <SectionTitle title="Businesses" />
+      <p style={styles.helperText}>Every business under this login, and a way to add another for {currency(ADDITIONAL_BUSINESS_PRICE)}/month.</p>
+
+      <SectionTitle title="Your businesses" small />
+      <div style={styles.list}>
+        {myBusinesses.map((b) => {
+          const isActive = biz.profile.businessId === b.shortId;
+          const cat = CATEGORIES.find((c) => c.id === b.categoryId);
+          return (
+            <div key={b.uuid} style={styles.listRow}>
+              <div>
+                <div style={styles.listRowTitle}>{b.name}{isActive ? " (active)" : ""}</div>
+                <div style={styles.listRowSub}>{cat?.name || b.categoryId} · {b.shortId}</div>
+              </div>
+              {!isActive && (
+                <button style={styles.smallAddBtn} disabled={switchingBusiness} onClick={() => switchBusiness(b.uuid)}>
+                  {switchingBusiness ? "Switching…" : "Switch here"}
+                </button>
+              )}
+            </div>
+          );
+        })}
+      </div>
+
+      {!showAddForm ? (
+        <button style={{ ...styles.primaryBtnSmall, marginTop: 16 }} onClick={() => setShowAddForm(true)}>
+          <Plus size={16} /> Add a business
+        </button>
+      ) : (
+        <div style={{ ...styles.formCard, marginTop: 16 }}>
+          <p style={styles.helperText}>A new business, fully separate from your others — its own items, sales, staff, and branches. {currency(ADDITIONAL_BUSINESS_PRICE)}/month, paid via PayChangu.</p>
+          <input style={styles.textInput} placeholder="Business name" value={newName} onChange={(e) => setNewName(e.target.value)} />
+          <select style={styles.textInput} value={newCategoryId} onChange={(e) => setNewCategoryId(e.target.value)}>
+            {CATEGORIES.map((c) => <option key={c.id} value={c.id}>{c.name}</option>)}
+          </select>
+          <button style={{ ...styles.primaryBtnSmall, opacity: (newName.trim() && !creating) ? 1 : 0.5 }} disabled={!newName.trim() || creating} onClick={startAddBusiness}>
+            <Wallet size={16} /> {creating ? "Opening PayChangu…" : `Pay ${currency(ADDITIONAL_BUSINESS_PRICE)} with PayChangu`}
+          </button>
+          <button style={{ ...styles.logoutBtn, marginTop: 8 }} onClick={() => setShowAddForm(false)}><X size={15} /> Cancel</button>
+        </div>
+      )}
     </div>
   );
 }
@@ -5669,6 +5724,7 @@ function MorePanel({ isOwner, isManager, currentEmployee, category, setTab }) {
         { id: "accounting", label: "Accounting", icon: BookOpen, desc: "Profit & loss, ledger, receivables, balance sheet", show: has("accounting") },
         { id: "reports", label: "Reports", icon: BarChart3, desc: "Cash flow, gross & net profit, Excel export", show: has("reports") },
         { id: "billing", label: "Packages & billing", icon: Wallet, desc: "Manage your plan and paid add-ons", show: isOwner },
+        { id: "businesses", label: "Businesses", icon: Building2, desc: "Switch between businesses, or add another one", show: isOwner },
       ],
     },
     {
