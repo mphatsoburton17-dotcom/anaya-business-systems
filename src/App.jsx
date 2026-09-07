@@ -6,7 +6,8 @@ import {
   Moon, Sun, Calculator, FileText, Printer, TrendingDown, TrendingUp, Download, Search as SearchIcon,
   CalendarDays, Lock, Mail, BookOpen, Wallet, HandCoins, Puzzle, HelpCircle, Phone, MessageCircle,
   Sparkles, Building2, Smartphone, Layers, Pencil, Share2,
-  ShoppingCart, Shirt, Hammer, Sofa, Pill, Wheat, GraduationCap, UtensilsCrossed, Cookie, Beer, Car
+  ShoppingCart, Shirt, Hammer, Sofa, Pill, Wheat, GraduationCap, UtensilsCrossed, Cookie, Beer, Car,
+  ClipboardList, Truck, CalendarClock, ChevronLeft
 } from "lucide-react";
 import * as XLSX from "xlsx";
 import { supabase } from "./supabaseClient";
@@ -576,6 +577,8 @@ function emptyBusiness(name, categoryId, details = {}) {
     items: [],       // products/services
     customers: [],
     orders: [],
+    quotes: [],      // quotations / estimates — can later convert into a real order
+    suppliers: [],   // formal supplier records (contact info + running spend, linked from restocks)
     employees: [
       { id: uid("emp"), name: ownerName ? `${ownerName} (Owner)` : "You (Owner)", role: "owner", pin: "0000" },
     ],
@@ -684,6 +687,8 @@ export default function App() {
       categories: biz_.categories || [],
       restocks: biz_.restocks || [],
       billingRequests: biz_.billingRequests || [],
+      quotes: biz_.quotes || [],
+      suppliers: biz_.suppliers || [],
       expenses: (biz_.expenses || []).map((e) => ({ branchId: defaultBranchId, ...e })),
       orders: (biz_.orders || []).map((o) => ({ branchId: defaultBranchId, ...o })),
       branches,
@@ -921,8 +926,17 @@ export default function App() {
         {tab === "orders" && (
           <OrdersPanel biz={biz} category={category} persist={persist} notify={notify} currentEmployee={currentEmployee} />
         )}
+        {tab === "quotes" && (
+          <QuotesPanel biz={biz} category={category} persist={persist} notify={notify} currentEmployee={currentEmployee} isOwner={isStaffView} />
+        )}
+        {tab === "calendar" && (
+          <CalendarPanel biz={biz} category={category} setTab={setTab} />
+        )}
         {tab === "customers" && (
           <CustomersPanel biz={biz} category={category} persist={persist} isOwner={isStaffView} setTab={setTab} />
+        )}
+        {tab === "suppliers" && (isOwner || isManager || hasModuleAccess(currentEmployee, "reports")) && (
+          <SuppliersPanel biz={biz} category={category} persist={persist} setTab={setTab} />
         )}
         {tab === "employees" && (isOwner || isManager || hasModuleAccess(currentEmployee, "hr")) && (
           <EmployeesPanel biz={biz} category={category} persist={persist} setTab={setTab} currentEmployee={currentEmployee} />
@@ -2049,12 +2063,14 @@ function Sidebar({ biz, category, tab, setTab, isOwner, isManager, canSee, unrea
       rows: [
         { id: "overview", label: "Dashboard", icon: BarChart3, show: true },
         { id: "alerts", label: "Alerts", icon: Bell, badge: unread, show: true },
+        { id: "calendar", label: "Calendar", icon: CalendarClock, show: true },
       ],
     },
     {
       title: "Sales & customers",
       rows: [
         { id: "orders", label: category.orderNounPlural, icon: Receipt, show: true },
+        { id: "quotes", label: "Quotes & Estimates", icon: ClipboardList, show: true },
         { id: "items", label: category.itemLabelPlural, icon: Package, show: true },
         { id: "customers", label: category.customerNounPlural, icon: Users, show: true },
         { id: "calculator", label: "Price calculator", icon: Calculator, show: true },
@@ -2065,6 +2081,7 @@ function Sidebar({ biz, category, tab, setTab, isOwner, isManager, canSee, unrea
       rows: [
         { id: "activity", label: "Activity", icon: CalendarDays, show: canSee("reports") },
         { id: "expenses", label: "Expenses", icon: TrendingDown, show: canSee("reports") },
+        { id: "suppliers", label: "Suppliers", icon: Truck, show: canSee("reports") },
         { id: "accounting", label: "Accounting", icon: BookOpen, show: canSee("accounting") },
         { id: "reports", label: "Reports", icon: BarChart3, show: canSee("reports") },
       ],
@@ -2389,6 +2406,7 @@ function Overview({ biz, category, isOwner, setTab }) {
       <div style={styles.quickRow}>
         <QuickAction icon={Plus} label={category.quickLabels.newItem} onClick={() => setTab("items")} />
         <QuickAction icon={Receipt} label={category.quickLabels.newOrder} onClick={() => setTab("orders")} />
+        <QuickAction icon={ClipboardList} label="New quote" onClick={() => setTab("quotes")} />
         {!isTotalsMode && <QuickAction icon={Users} label={category.quickLabels.people} onClick={() => setTab("customers")} />}
       </div>
 
@@ -2513,13 +2531,15 @@ function SectionTitle({ title, small }) {
    ========================================================= */
 function ItemsPanel({ biz, category, persist, notify, isOwner }) {
   const isPharmacy = biz.profile?.businessSubtypeId === "pharmacy";
+  const isPropertyBiz = category.id === "property";
   const [showForm, setShowForm] = useState(false);
-  const [form, setForm] = useState({ name: "", price: "", cost: "", stock: "", meta: "", itemCategory: "", unit: "pcs", expiryDate: "", batchNumber: "", requiresPrescription: false });
+  const [form, setForm] = useState({ name: "", price: "", cost: "", stock: "", meta: "", itemCategory: "", unit: "pcs", expiryDate: "", batchNumber: "", requiresPrescription: false, dueDay: "1" });
   const [query, setQuery] = useState("");
   const [newTag, setNewTag] = useState("");
   const [restockingId, setRestockingId] = useState(null); // item id currently showing the restock form
-  const [restockForm, setRestockForm] = useState({ qty: "", costPerUnit: "", supplier: "", logExpense: true });
+  const [restockForm, setRestockForm] = useState({ qty: "", costPerUnit: "", supplierId: "", supplier: "", logExpense: true });
   const bizCategories = biz.categories || [];
+  const suppliers = biz.suppliers || [];
 
   const addCategoryTag = () => {
     const clean = newTag.trim();
@@ -2546,10 +2566,11 @@ function ItemsPanel({ biz, category, persist, notify, isOwner }) {
       expiryDate: isPharmacy && form.expiryDate ? form.expiryDate : undefined,
       batchNumber: isPharmacy && form.batchNumber.trim() ? form.batchNumber.trim() : undefined,
       requiresPrescription: isPharmacy ? !!form.requiresPrescription : undefined,
+      dueDay: isPropertyBiz ? (Math.min(28, Math.max(1, Number(form.dueDay) || 1))) : undefined,
     };
     let next = { ...biz, items: [item, ...biz.items] };
     persist(next);
-    setForm({ name: "", price: "", cost: "", stock: "", meta: "", itemCategory: "", unit: "pcs", expiryDate: "", batchNumber: "", requiresPrescription: false });
+    setForm({ name: "", price: "", cost: "", stock: "", meta: "", itemCategory: "", unit: "pcs", expiryDate: "", batchNumber: "", requiresPrescription: false, dueDay: "1" });
     setShowForm(false);
   };
 
@@ -2559,7 +2580,7 @@ function ItemsPanel({ biz, category, persist, notify, isOwner }) {
 
   const openRestock = (item) => {
     setRestockingId(item.id);
-    setRestockForm({ qty: "", costPerUnit: item.cost ? String(item.cost) : "", supplier: "", logExpense: true });
+    setRestockForm({ qty: "", costPerUnit: item.cost ? String(item.cost) : "", supplierId: "", supplier: "", logExpense: true });
   };
 
   const submitRestock = (item) => {
@@ -2567,6 +2588,8 @@ function ItemsPanel({ biz, category, persist, notify, isOwner }) {
     const costPerUnit = Number(restockForm.costPerUnit);
     if (!qty || qty <= 0 || !costPerUnit || costPerUnit < 0) return;
     const totalCost = Math.round(qty * costPerUnit);
+    const pickedSupplier = restockForm.supplierId ? suppliers.find((s) => s.id === restockForm.supplierId) : null;
+    const supplierName = pickedSupplier ? pickedSupplier.name : (restockForm.supplier.trim() || null);
     const record = {
       id: uid("restock"),
       itemId: item.id,
@@ -2575,7 +2598,8 @@ function ItemsPanel({ biz, category, persist, notify, isOwner }) {
       unit: item.unit || "pcs",
       costPerUnit,
       totalCost,
-      supplier: restockForm.supplier.trim() || null,
+      supplier: supplierName,
+      supplierId: pickedSupplier ? pickedSupplier.id : null,
       sellPriceAtTime: item.price,
       ts: Date.now(),
       branchId: biz.settings?.activeBranchId || biz.branches?.[0]?.id || null,
@@ -2599,7 +2623,7 @@ function ItemsPanel({ biz, category, persist, notify, isOwner }) {
     next = notify(next, "stock", `Restocked ${qty} ${unitLabel(item.unit, qty !== 1)} of ${item.name} — ${currency(totalCost)} total${record.supplier ? ` from ${record.supplier}` : ""}`);
     persist(next);
     setRestockingId(null);
-    setRestockForm({ qty: "", costPerUnit: "", supplier: "", logExpense: true });
+    setRestockForm({ qty: "", costPerUnit: "", supplierId: "", supplier: "", logExpense: true });
   };
 
   const recentRestocks = filterByBranch(biz.restocks || [], biz.settings?.activeBranchId).slice(0, 8);
@@ -2656,6 +2680,15 @@ function ItemsPanel({ biz, category, persist, notify, isOwner }) {
           ) : (
             <input style={styles.textInput} type={category.id === "property" ? "text" : "number"} placeholder={category.extraFieldLabel}
               value={form.meta} onChange={(e) => setForm({ ...form, meta: e.target.value })} />
+          )}
+
+          {isPropertyBiz && (
+            <>
+              <div style={styles.miniLabel}>Rent due day of month</div>
+              <input style={{ ...styles.textInput, marginTop: 6 }} type="number" min="1" max="28" placeholder="e.g. 1"
+                value={form.dueDay} onChange={(e) => setForm({ ...form, dueDay: e.target.value })} />
+              <p style={{ ...styles.helperText, marginTop: -8 }}>Used to mark this property on the Calendar tab each month.</p>
+            </>
           )}
 
           {isPharmacy && (
@@ -2728,7 +2761,7 @@ function ItemsPanel({ biz, category, persist, notify, isOwner }) {
                     )}
                     {category.id === "property" ? (
                       <span style={!item.meta ? styles.lowStockText : undefined}>
-                        {"  ·  "}{item.meta ? `Tenant: ${item.meta}` : "Vacant"}
+                        {"  ·  "}{item.meta ? `Tenant: ${item.meta}` : "Vacant"}{item.dueDay ? ` · Due day ${item.dueDay}` : ""}
                       </span>
                     ) : (!category.hasStock && item.meta && (
                       <span>{"  ·  "}{item.meta} {category.id === "service" ? "min" : category.id === "repair" ? "hrs" : ""}</span>
@@ -2773,8 +2806,21 @@ function ItemsPanel({ biz, category, persist, notify, isOwner }) {
                     <input style={styles.textInputHalf} type="number" placeholder={`Cost per ${item.unit || "pcs"} (MWK)`}
                       value={restockForm.costPerUnit} onChange={(e) => setRestockForm({ ...restockForm, costPerUnit: e.target.value })} />
                   </div>
-                  <input style={styles.textInput} placeholder="Supplier / wholesaler (optional)"
-                    value={restockForm.supplier} onChange={(e) => setRestockForm({ ...restockForm, supplier: e.target.value })} />
+                  <div style={styles.miniLabel}>Supplier</div>
+                  {suppliers.length > 0 && (
+                    <select style={styles.textInput} value={restockForm.supplierId}
+                      onChange={(e) => setRestockForm({ ...restockForm, supplierId: e.target.value, supplier: "" })}>
+                      <option value="">Type a name below instead…</option>
+                      {suppliers.map((s) => <option key={s.id} value={s.id}>{s.name}</option>)}
+                    </select>
+                  )}
+                  {!restockForm.supplierId && (
+                    <input style={styles.textInput} placeholder="Supplier / wholesaler name (optional)"
+                      value={restockForm.supplier} onChange={(e) => setRestockForm({ ...restockForm, supplier: e.target.value })} />
+                  )}
+                  {suppliers.length === 0 && (
+                    <p style={{ ...styles.helperText, marginTop: -8 }}>Tip: add this supplier under the Suppliers tab to track your total spend with them over time.</p>
+                  )}
                   <label style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 13, color: "var(--ink-faint)", marginBottom: 12, cursor: "pointer" }}>
                     <input type="checkbox" checked={restockForm.logExpense}
                       onChange={(e) => setRestockForm({ ...restockForm, logExpense: e.target.checked })} />
@@ -3257,6 +3303,321 @@ function InvoiceModal({ order, biz, category, onClose, onEdit }) {
           )}
         </div>
       </div>
+    </div>
+  );
+}
+
+/* =========================================================
+   QUOTATIONS & ESTIMATES
+   A formal price quote a customer can review before committing — the natural
+   step before an order when someone asks "how much would X + Y cost?". A quote
+   can later be converted straight into a real sale (with stock decremented and
+   the customer recorded), so nothing has to be re-typed once they say yes.
+   ========================================================= */
+const QUOTE_STATUS_LABELS = { sent: "Sent", accepted: "Accepted", declined: "Declined", converted: "Converted to sale" };
+function quoteIsExpired(q) {
+  return q.status === "sent" && q.validUntil && Date.now() > q.validUntil;
+}
+function QuoteStatusBadge({ quote }) {
+  const expired = quoteIsExpired(quote);
+  const map = {
+    sent: { bg: "var(--gold-soft)", fg: "#8A6D00" },
+    accepted: { bg: "var(--accent-soft)", fg: "var(--accent)" },
+    declined: { bg: "rgba(178,58,46,0.12)", fg: "#B23A2E" },
+    converted: { bg: "var(--accent-soft)", fg: "var(--accent)" },
+  };
+  const s = map[quote.status] || map.sent;
+  const label = expired ? "Expired" : QUOTE_STATUS_LABELS[quote.status] || quote.status;
+  return <span style={{ ...styles.badge, background: expired ? "rgba(178,58,46,0.12)" : s.bg, color: expired ? "#B23A2E" : s.fg }}>{label}</span>;
+}
+
+function QuotesPanel({ biz, category, persist, notify, currentEmployee, isOwner }) {
+  const [showForm, setShowForm] = useState(false);
+  const [selectedItemId, setSelectedItemId] = useState("");
+  const [qty, setQty] = useState(1);
+  const [cart, setCart] = useState([]);
+  const [customName, setCustomName] = useState("");
+  const [customPrice, setCustomPrice] = useState("");
+  const [customerName, setCustomerName] = useState("");
+  const [phone, setPhone] = useState("");
+  const [validDays, setValidDays] = useState("7");
+  const [note, setNote] = useState("");
+  const [viewingQuote, setViewingQuote] = useState(null);
+  const [convertPaymentMethod, setConvertPaymentMethod] = useState("Cash");
+
+  const selectedUnit = biz.items.find((i) => i.id === selectedItemId)?.unit || "pcs";
+
+  const addToCart = () => {
+    const item = biz.items.find((i) => i.id === selectedItemId);
+    if (!item) return;
+    setCart([...cart, { itemId: item.id, name: item.name, price: item.price, category: item.category, unit: item.unit, qty: Number(qty) || 1 }]);
+    setSelectedItemId("");
+    setQty(1);
+  };
+  const addCustomLine = () => {
+    if (!customName.trim() || !customPrice) return;
+    setCart([...cart, { itemId: null, name: customName.trim(), price: Number(customPrice), unit: "pcs", qty: 1 }]);
+    setCustomName("");
+    setCustomPrice("");
+  };
+  const removeLine = (idx) => setCart(cart.filter((_, i) => i !== idx));
+
+  const subtotal = cart.reduce((s, c) => s + c.price * c.qty, 0);
+  const taxRate = biz.settings?.taxRate || 0;
+  const discountRate = subtotal >= (biz.settings?.discountThreshold || Infinity) ? (biz.settings?.discountRate || 0) : 0;
+  const discountAmount = subtotal * (discountRate / 100);
+  const taxAmount = (subtotal - discountAmount) * (taxRate / 100);
+  const total = Math.round(subtotal - discountAmount + taxAmount);
+
+  const branchQuotes = filterByBranch(biz.quotes || [], biz.settings?.activeBranchId).slice().sort((a, b) => b.ts - a.ts);
+
+  const resetForm = () => {
+    setCart([]); setCustomerName(""); setPhone(""); setValidDays("7"); setNote("");
+    setCustomName(""); setCustomPrice(""); setShowForm(false);
+  };
+
+  const submitQuote = () => {
+    if (cart.length === 0) return;
+    const quote = {
+      id: uid("quote"),
+      code: `Q-${Date.now().toString().slice(-6)}`,
+      items: cart,
+      subtotal, discountAmount, taxAmount, taxRate, total,
+      customerName: customerName.trim() || null,
+      phone: phone.trim() || null,
+      note: note.trim(),
+      status: "sent",
+      ts: Date.now(),
+      validUntil: Date.now() + (Number(validDays) || 7) * 86400000,
+      branchId: biz.settings?.activeBranchId || biz.branches?.[0]?.id || null,
+      convertedOrderId: null,
+    };
+    let next = { ...biz, quotes: [quote, ...(biz.quotes || [])] };
+    next = notify(next, "quote", `Quote ${quote.code} for ${currency(quote.total)} created${quote.customerName ? " for " + quote.customerName : ""}`);
+    persist(next);
+    setViewingQuote(quote);
+    resetForm();
+  };
+
+  const setQuoteStatus = (quote, status) => {
+    const next = { ...biz, quotes: biz.quotes.map((q) => q.id === quote.id ? { ...q, status } : q) };
+    persist(next);
+    setViewingQuote({ ...quote, status });
+  };
+
+  const deleteQuote = (quote) => {
+    persist({ ...biz, quotes: biz.quotes.filter((q) => q.id !== quote.id) });
+    setViewingQuote(null);
+  };
+
+  // Converts an accepted/sent quote straight into a real sale — same effects a normal
+  // order has (stock decremented, customer recorded), so nothing needs re-entering.
+  const convertToSale = (quote) => {
+    const order = {
+      id: uid("ord"),
+      items: quote.items,
+      subtotal: quote.subtotal, discountAmount: quote.discountAmount, taxAmount: quote.taxAmount,
+      taxRate: quote.taxRate, total: quote.total, quickSale: false,
+      customerName: quote.customerName,
+      paymentMethod: convertPaymentMethod,
+      status: "paid",
+      paymentStatus: convertPaymentMethod === "On credit" ? "credit" : "paid",
+      employeeId: currentEmployee.id,
+      branchId: quote.branchId || biz.settings?.activeBranchId || biz.branches?.[0]?.id || null,
+      ts: Date.now(),
+      fromQuoteId: quote.id,
+    };
+    let next = { ...biz, orders: [order, ...biz.orders] };
+    if (category.hasStock) {
+      next = {
+        ...next,
+        items: next.items.map((it) => {
+          const line = quote.items.find((c) => c.itemId === it.id);
+          if (line && it.stock !== undefined) return { ...it, stock: Math.max(0, it.stock - line.qty) };
+          return it;
+        }),
+      };
+    }
+    if (quote.customerName) {
+      const nameLower = quote.customerName.trim().toLowerCase();
+      const existing = next.customers.find((c) => c.name.toLowerCase() === nameLower);
+      next = existing
+        ? { ...next, customers: next.customers.map((c) => c.id === existing.id ? { ...c, orders: c.orders + 1 } : c) }
+        : { ...next, customers: [{ id: uid("cust"), name: quote.customerName.trim(), phone: quote.phone || "", orders: 1 }, ...next.customers] };
+    }
+    next = { ...next, quotes: next.quotes.map((q) => q.id === quote.id ? { ...q, status: "converted", convertedOrderId: order.id } : q) };
+    next = notify(next, "payment", `Quote ${quote.code} converted to a sale — ${currency(order.total)}${quote.customerName ? " from " + quote.customerName : ""}`);
+    persist(next);
+    setViewingQuote({ ...quote, status: "converted", convertedOrderId: order.id });
+  };
+
+  return (
+    <div style={styles.panel}>
+      <div style={styles.panelHeader}>
+        <SectionTitle title="Quotes & Estimates" />
+        {isOwner && (
+          <button style={styles.addBtn} onClick={() => (showForm ? resetForm() : setShowForm(true))}>
+            {showForm ? <><X size={16} /> Cancel</> : <><Plus size={16} /> New quote</>}
+          </button>
+        )}
+      </div>
+      <p style={styles.helperText}>Give a customer a formal price before they commit — for existing {category.itemLabelPlural.toLowerCase()} or one-off lines like delivery. Convert it into a real sale the moment they say yes.</p>
+
+      {showForm && (
+        <div style={styles.formCard}>
+          <div style={styles.formRow}>
+            <select style={{ ...styles.textInputHalf, minWidth: 0 }} value={selectedItemId} onChange={(e) => { setSelectedItemId(e.target.value); setQty(1); }}>
+              <option value="">Select {category.itemLabel.toLowerCase()}…</option>
+              {itemsForBranch(biz.items, biz.settings?.activeBranchId).map((i) => (
+                <option key={i.id} value={i.id}>{i.name} — {currency(i.price)}{category.hasStock && i.unit && i.unit !== "pcs" ? `/${i.unit}` : ""}</option>
+              ))}
+            </select>
+            <input style={styles.qtyInput} type="number" min="0" step={selectedUnit !== "pcs" ? "any" : "1"}
+              placeholder={selectedUnit !== "pcs" ? selectedUnit : ""} value={qty} onChange={(e) => setQty(e.target.value)} />
+            <button style={styles.smallAddBtn} onClick={addToCart}>Add</button>
+          </div>
+
+          <div style={styles.miniLabel}>Or add a one-off line (e.g. delivery, installation)</div>
+          <div style={styles.formRow}>
+            <input style={styles.textInputHalf} placeholder="Description" value={customName} onChange={(e) => setCustomName(e.target.value)} />
+            <input style={{ ...styles.textInputHalf, maxWidth: 110 }} type="number" placeholder="Price" value={customPrice} onChange={(e) => setCustomPrice(e.target.value)} />
+            <button style={styles.smallAddBtn} onClick={addCustomLine}>Add</button>
+          </div>
+
+          {cart.length > 0 && (
+            <div style={styles.cartBox}>
+              {cart.map((c, idx) => (
+                <div key={idx} style={styles.cartRow}>
+                  <span>{c.qty} {c.unit && c.unit !== "pcs" ? c.unit : "×"} {c.name}</span>
+                  <span style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                    <span style={styles.mono}>{currency(c.price * c.qty)}</span>
+                    <button type="button" style={{ ...styles.iconBtn, padding: 0 }} onClick={() => removeLine(idx)}><X size={13} /></button>
+                  </span>
+                </div>
+              ))}
+              {discountAmount > 0 && (
+                <div style={styles.cartRow}><span>Discount ({biz.settings.discountRate}%)</span><span style={styles.mono}>−{currency(discountAmount)}</span></div>
+              )}
+              {taxAmount > 0 && (
+                <div style={styles.cartRow}><span>Tax ({taxRate}%)</span><span style={styles.mono}>+{currency(taxAmount)}</span></div>
+              )}
+              <div style={styles.cartTotalRow}><span>Total</span><span style={styles.mono}>{currency(total)}</span></div>
+            </div>
+          )}
+
+          <input style={styles.textInput} placeholder={`${category.customerNoun} name (optional)`}
+            value={customerName} onChange={(e) => setCustomerName(e.target.value)} />
+          <input style={styles.textInput} placeholder="Phone number (optional)"
+            value={phone} onChange={(e) => setPhone(e.target.value)} />
+          <div style={styles.formRow}>
+            <div style={{ flex: 1 }}>
+              <div style={styles.miniLabel}>Valid for (days)</div>
+              <input style={styles.textInputHalf} type="number" min="1" value={validDays} onChange={(e) => setValidDays(e.target.value)} />
+            </div>
+          </div>
+          <textarea style={styles.textArea} rows={2} placeholder="Note for the customer (optional)"
+            value={note} onChange={(e) => setNote(e.target.value)} />
+
+          <button style={{ ...styles.primaryBtnSmall, opacity: cart.length ? 1 : 0.4 }} disabled={!cart.length} onClick={submitQuote}>
+            <Check size={16} /> Save quote
+          </button>
+        </div>
+      )}
+
+      {branchQuotes.length === 0 ? (
+        <EmptyState text="No quotes yet — create one above when a customer asks for a price before committing." icon={ClipboardList} />
+      ) : (
+        <div style={styles.list}>
+          {branchQuotes.map((q) => (
+            <button key={q.id} className="lift-card" style={styles.listRowClickable} onClick={() => { setViewingQuote(q); setConvertPaymentMethod("Cash"); }}>
+              <div>
+                <div style={styles.listRowTitle}>{q.code} — {q.customerName || "No name given"}</div>
+                <div style={styles.listRowSub}>
+                  {q.items.map((i) => i.name).join(", ")} · {new Date(q.ts).toLocaleDateString()}
+                </div>
+              </div>
+              <div style={styles.listRowRight}>
+                <div style={styles.mono}>{currency(q.total)}</div>
+                <QuoteStatusBadge quote={q} />
+              </div>
+            </button>
+          ))}
+        </div>
+      )}
+
+      {viewingQuote && (
+        <div style={styles.modalOverlay} onClick={() => setViewingQuote(null)}>
+          <div style={styles.modalCard} onClick={(e) => e.stopPropagation()}>
+            <div style={styles.invoiceHeader}>
+              <div>
+                <div style={styles.invoiceBrand}>{biz.profile.name}</div>
+                <div style={styles.invoiceMeta}>Quotation {viewingQuote.code}</div>
+                <div style={styles.invoiceMeta}>{new Date(viewingQuote.ts).toLocaleDateString()} · valid until {new Date(viewingQuote.validUntil).toLocaleDateString()}</div>
+              </div>
+              <button style={styles.iconBtn} onClick={() => setViewingQuote(null)}><X size={18} /></button>
+            </div>
+            <div style={styles.invoiceCustomer}>For: {viewingQuote.customerName || `Unnamed ${category.customerNoun.toLowerCase()}`}{viewingQuote.phone ? ` · ${viewingQuote.phone}` : ""}</div>
+            <div style={styles.invoiceItems}>
+              {viewingQuote.items.map((it, idx) => (
+                <div key={idx} style={styles.invoiceItemRow}>
+                  <span>{it.qty}× {it.name}</span>
+                  <span style={styles.mono}>{currency(it.price * it.qty)}</span>
+                </div>
+              ))}
+            </div>
+            {viewingQuote.discountAmount > 0 && (
+              <div style={styles.invoiceItemRow}><span>Discount</span><span style={styles.mono}>−{currency(viewingQuote.discountAmount)}</span></div>
+            )}
+            {viewingQuote.taxAmount > 0 && (
+              <div style={styles.invoiceItemRow}><span>Tax ({viewingQuote.taxRate}%)</span><span style={styles.mono}>+{currency(viewingQuote.taxAmount)}</span></div>
+            )}
+            <div style={styles.invoiceTotalRow}><span>Total</span><span style={styles.mono}>{currency(viewingQuote.total)}</span></div>
+            {viewingQuote.note && <p style={{ ...styles.helperText, marginTop: 10 }}>{viewingQuote.note}</p>}
+            <div style={styles.invoiceStatus}><QuoteStatusBadge quote={viewingQuote} /></div>
+
+            {viewingQuote.status !== "converted" && viewingQuote.status !== "declined" && (
+              <div style={{ ...styles.formCard, marginTop: 12, marginBottom: 0 }}>
+                <div style={styles.miniLabel}>Convert to a real sale</div>
+                <div style={styles.paymentMethodRow}>
+                  {["Cash", "On credit"].map((m) => (
+                    <button key={m} style={{ ...styles.paymentChip, ...(convertPaymentMethod === m ? styles.paymentChipActive : {}) }} onClick={() => setConvertPaymentMethod(m)}>{m}</button>
+                  ))}
+                </div>
+                <button style={styles.primaryBtnSmall} onClick={() => convertToSale(viewingQuote)}>
+                  <Check size={16} /> Convert to sale
+                </button>
+              </div>
+            )}
+
+            {viewingQuote.status === "converted" && (
+              <Callout icon={Check} tone="info">This quote has been converted to a sale.</Callout>
+            )}
+
+            <div style={{ display: "flex", gap: 8, marginTop: 12 }}>
+              <button style={{ ...styles.printBtn, flex: 1 }} onClick={() => window.print()}>
+                <Printer size={15} /> Print / save as PDF
+              </button>
+              <button style={{ ...styles.printBtn, flex: 1, background: "none", border: "1px solid var(--line)", color: "var(--ink)" }}
+                onClick={() => shareText(`Quote ${viewingQuote.code}`, [
+                  biz.profile.name, `Quotation ${viewingQuote.code}`, `Valid until ${new Date(viewingQuote.validUntil).toLocaleDateString()}`, "",
+                  ...viewingQuote.items.map((it) => `${it.qty}× ${it.name} — ${currency(it.price * it.qty)}`), "",
+                  `Total: ${currency(viewingQuote.total)}`,
+                ].join("\n"))}>
+                <Share2 size={15} /> Share
+              </button>
+            </div>
+            {viewingQuote.status === "sent" && (
+              <div style={{ display: "flex", gap: 8, marginTop: 8 }}>
+                <button style={{ ...styles.printBtn, flex: 1, background: "none", border: "1px solid var(--line)", color: "var(--ink)" }} onClick={() => setQuoteStatus(viewingQuote, "accepted")}>Mark accepted</button>
+                <button style={{ ...styles.printBtn, flex: 1, background: "none", border: "1px solid var(--line)", color: "var(--ink)" }} onClick={() => setQuoteStatus(viewingQuote, "declined")}>Mark declined</button>
+              </div>
+            )}
+            {viewingQuote.status !== "converted" && (
+              <button style={{ ...styles.logoutBtn, marginTop: 8 }} onClick={() => deleteQuote(viewingQuote)}><Trash2 size={15} /> Delete quote</button>
+            )}
+          </div>
+        </div>
+      )}
     </div>
   );
 }
@@ -4104,6 +4465,141 @@ function ExpensesPanel({ biz, category: bizCategory, persist, setTab, currentEmp
 }
 
 /* =========================================================
+   SUPPLIERS
+   A formal supplier record — contact info, what you buy from them, and a running
+   total spent — built on top of the restocking log that already exists. Restocks
+   can optionally be tied to a supplierId (see ItemsPanel); this panel is where
+   that spend adds up.
+   ========================================================= */
+function SuppliersPanel({ biz, category, persist, setTab }) {
+  const [showForm, setShowForm] = useState(false);
+  const [editingId, setEditingId] = useState(null);
+  const [form, setForm] = useState({ name: "", phone: "", email: "", address: "", suppliesWhat: "" });
+  const [expandedId, setExpandedId] = useState(null);
+  const [query, setQuery] = useState("");
+
+  const suppliers = biz.suppliers || [];
+  const restocks = biz.restocks || [];
+
+  const statsFor = (supplier) => {
+    // Matches restocks linked by supplierId, plus older restocks that only ever
+    // had a free-text supplier name matching this one (before Suppliers existed).
+    const matching = restocks.filter((r) => r.supplierId === supplier.id
+      || (!r.supplierId && r.supplier && r.supplier.trim().toLowerCase() === supplier.name.trim().toLowerCase()));
+    const totalSpent = matching.reduce((s, r) => s + r.totalCost, 0);
+    const lastRestock = matching.length ? Math.max(...matching.map((r) => r.ts)) : null;
+    return { totalSpent, lastRestock, restockCount: matching.length };
+  };
+
+  const startAdd = () => {
+    setEditingId(null);
+    setForm({ name: "", phone: "", email: "", address: "", suppliesWhat: "" });
+    setShowForm((s) => !s);
+  };
+  const startEdit = (s) => {
+    setEditingId(s.id);
+    setForm({ name: s.name, phone: s.phone || "", email: s.email || "", address: s.address || "", suppliesWhat: s.suppliesWhat || "" });
+    setShowForm(true);
+  };
+  const saveSupplier = () => {
+    if (!form.name.trim()) return;
+    if (editingId) {
+      persist({ ...biz, suppliers: suppliers.map((s) => s.id === editingId ? { ...s, ...form, name: form.name.trim() } : s) });
+    } else {
+      const supplier = { id: uid("sup"), name: form.name.trim(), phone: form.phone.trim(), email: form.email.trim(), address: form.address.trim(), suppliesWhat: form.suppliesWhat.trim(), ts: Date.now() };
+      persist({ ...biz, suppliers: [supplier, ...suppliers] });
+    }
+    setEditingId(null);
+    setForm({ name: "", phone: "", email: "", address: "", suppliesWhat: "" });
+    setShowForm(false);
+  };
+  const removeSupplier = (id) => {
+    persist({ ...biz, suppliers: suppliers.filter((s) => s.id !== id) });
+  };
+
+  const contactSupplier = (s) => {
+    shareText(`Message for ${s.name}`, `Hi ${s.name}, this is ${biz.profile.name}. `);
+  };
+
+  const filtered = suppliers.filter((s) => s.name.toLowerCase().includes(query.toLowerCase()));
+  const totalSpentAllSuppliers = suppliers.reduce((sum, s) => sum + statsFor(s).totalSpent, 0);
+
+  return (
+    <div style={styles.panel}>
+      <BackRow onBack={() => setTab("more")} label="More" />
+      <div style={styles.panelHeader}>
+        <SectionTitle title="Suppliers" />
+        <button style={styles.addBtn} onClick={startAdd}>
+          <Plus size={16} /> Add
+        </button>
+      </div>
+      <p style={styles.helperText}>Keep contact details for who you buy stock from, and see how much you've spent with each one over time — pulled automatically from your Restocking log.</p>
+
+      <div style={styles.statGrid}>
+        <StatCard label="Suppliers" value={suppliers.length} />
+        <StatCard label="Total spent (all time)" value={currency(totalSpentAllSuppliers)} />
+      </div>
+
+      {showForm && (
+        <div style={styles.formCard}>
+          <input style={styles.textInput} placeholder="Supplier / business name" value={form.name} onChange={(e) => setForm((f) => ({ ...f, name: e.target.value }))} />
+          <input style={styles.textInput} placeholder="Phone number" value={form.phone} onChange={(e) => setForm((f) => ({ ...f, phone: e.target.value }))} />
+          <input style={styles.textInput} type="email" placeholder="Email (optional)" value={form.email} onChange={(e) => setForm((f) => ({ ...f, email: e.target.value }))} />
+          <input style={styles.textInput} placeholder="Address / location (optional)" value={form.address} onChange={(e) => setForm((f) => ({ ...f, address: e.target.value }))} />
+          <input style={styles.textInput} placeholder="What you buy from them (e.g. rice, cooking oil)" value={form.suppliesWhat} onChange={(e) => setForm((f) => ({ ...f, suppliesWhat: e.target.value }))} />
+          <button style={styles.primaryBtnSmall} onClick={saveSupplier}>
+            <Check size={16} /> {editingId ? "Save changes" : "Save supplier"}
+          </button>
+        </div>
+      )}
+
+      {suppliers.length === 0 ? (
+        <EmptyState text="Add a supplier here, then pick them next time you restock an item — their running total builds up automatically." icon={Truck} />
+      ) : (
+        <>
+          {suppliers.length > 4 && (
+            <div style={styles.searchWrap}>
+              <SearchIcon size={15} color="var(--ink-faint)" />
+              <input style={styles.searchInput} placeholder="Search suppliers…" value={query} onChange={(e) => setQuery(e.target.value)} />
+            </div>
+          )}
+          <div style={styles.list}>
+            {filtered.map((s) => {
+              const { totalSpent, lastRestock, restockCount } = statsFor(s);
+              const isExpanded = expandedId === s.id;
+              return (
+                <div key={s.id} style={styles.listRow}>
+                  <button type="button" style={{ all: "unset", cursor: "pointer", flex: 1 }} onClick={() => setExpandedId(isExpanded ? null : s.id)}>
+                    <div style={styles.listRowTitle}>{s.name}</div>
+                    <div style={styles.listRowSub}>
+                      {restockCount} restock{restockCount !== 1 ? "s" : ""}{totalSpent > 0 ? ` · ${currency(totalSpent)} spent` : ""}{s.suppliesWhat ? ` · ${s.suppliesWhat}` : ""}
+                    </div>
+                    {isExpanded && (
+                      <div style={{ marginTop: 8, display: "flex", flexDirection: "column", gap: 4 }}>
+                        {s.phone && <div style={styles.staffDetailLine}>Phone: {s.phone}</div>}
+                        {s.email && <div style={styles.staffDetailLine}>Email: {s.email}</div>}
+                        {s.address && <div style={styles.staffDetailLine}>Address: {s.address}</div>}
+                        {lastRestock && <div style={styles.staffDetailLine}>Last restock: {new Date(lastRestock).toLocaleDateString()}</div>}
+                        {!restockCount && <div style={styles.staffDetailLine}>No restocks logged with this supplier yet.</div>}
+                      </div>
+                    )}
+                  </button>
+                  <div style={{ display: "flex", gap: 4 }}>
+                    {s.phone && <button style={styles.iconBtn} title="Message" onClick={() => contactSupplier(s)}><MessageCircle size={15} /></button>}
+                    <button style={styles.iconBtn} title="Edit" onClick={() => startEdit(s)}><Pencil size={15} /></button>
+                    <button style={styles.iconBtn} title="Remove" onClick={() => removeSupplier(s.id)}><Trash2 size={15} /></button>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+
+/* =========================================================
    DAILY ACTIVITY (calendar-style log, owner only)
    ========================================================= */
 function isSameDay(ts, dateObj) {
@@ -4333,6 +4829,165 @@ function ActivityPanel({ biz, category, setTab }) {
 }
 
 /* =========================================================
+   CALENDAR / SCHEDULING VIEW
+   A month-grid view of what's happening on each day — bookings for Service
+   businesses, rent due-dates for Property businesses, and a general sales-by-day
+   view for everyone else. Built entirely from data that already exists (orders,
+   and each property's due-day), so no new booking system is needed underneath.
+   ========================================================= */
+const WEEKDAY_LABELS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+
+function buildMonthGrid(monthDate) {
+  const year = monthDate.getFullYear();
+  const month = monthDate.getMonth();
+  const numDays = new Date(year, month + 1, 0).getDate();
+  const firstDow = new Date(year, month, 1).getDay(); // 0 = Sunday
+  const leadingBlanks = (firstDow + 6) % 7; // Monday-start offset
+  const cells = [];
+  for (let i = 0; i < leadingBlanks; i++) cells.push(null);
+  for (let d = 1; d <= numDays; d++) cells.push(new Date(year, month, d));
+  while (cells.length % 7 !== 0) cells.push(null);
+  return cells;
+}
+
+function CalendarPanel({ biz, category, setTab }) {
+  const [monthDate, setMonthDate] = useState(new Date());
+  const [selectedDate, setSelectedDate] = useState(new Date());
+  const today = new Date();
+  const isPropertyBiz = category.id === "property";
+  const isServiceBiz = category.id === "service";
+
+  const branchOrders = filterByBranch(biz.orders, biz.settings?.activeBranchId);
+  const properties = itemsForBranch(biz.items, biz.settings?.activeBranchId).filter((i) => i.meta);
+
+  const shiftMonth = (delta) => { const d = new Date(monthDate); d.setMonth(d.getMonth() + delta); setMonthDate(d); };
+  const isCurrentMonth = monthDate.getFullYear() === today.getFullYear() && monthDate.getMonth() === today.getMonth();
+
+  // Rent-due marker for a given day, for property businesses: which occupied properties
+  // have their due-day on this date, and whether that month's rent has been logged for them.
+  const propertiesDueOn = (date) => {
+    if (!isPropertyBiz) return [];
+    const monthStart = new Date(date.getFullYear(), date.getMonth(), 1);
+    const monthEnd = new Date(date.getFullYear(), date.getMonth() + 1, 0, 23, 59, 59, 999);
+    const monthOrders = branchOrders.filter((o) => inRange(o.ts, monthStart, monthEnd));
+    const paidItemIds = new Set(monthOrders.flatMap((o) => (o.items || []).map((it) => it.itemId)).filter(Boolean));
+    return properties
+      .filter((p) => (p.dueDay || 1) === date.getDate())
+      .map((p) => ({ property: p, paid: paidItemIds.has(p.id) }));
+  };
+
+  const ordersOn = (date) => branchOrders.filter((o) => isSameDay(o.ts, date));
+
+  const cells = buildMonthGrid(monthDate);
+  const selectedProperties = propertiesDueOn(selectedDate);
+  const selectedOrders = ordersOn(selectedDate);
+
+  const cs = {
+    weekHeader: { display: "grid", gridTemplateColumns: "repeat(7, 1fr)", gap: 4, marginBottom: 6 },
+    weekHeaderCell: { textAlign: "center", fontSize: 10.5, fontWeight: 700, color: "var(--ink-faint)", textTransform: "uppercase" },
+    grid: { display: "grid", gridTemplateColumns: "repeat(7, 1fr)", gap: 4, marginBottom: 18 },
+    cell: { aspectRatio: "1", border: "1px solid var(--line)", borderRadius: 8, background: "var(--surface)", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", cursor: "pointer", padding: 2, position: "relative", fontFamily: "inherit" },
+    cellEmpty: { aspectRatio: "1", background: "none", border: "none" },
+    cellToday: { border: "1.5px solid var(--accent)" },
+    cellSelected: { background: "var(--accent-soft)", borderColor: "var(--accent)" },
+    cellNum: { fontSize: 12.5, fontWeight: 600, color: "var(--ink)" },
+    cellDot: { width: 5, height: 5, borderRadius: "50%", marginTop: 2 },
+  };
+
+  const dotColorForDay = (date) => {
+    if (isPropertyBiz) {
+      const due = propertiesDueOn(date);
+      if (!due.length) return null;
+      return due.some((d) => !d.paid) ? "#B23A2E" : "#22A06B";
+    }
+    const orders = ordersOn(date);
+    return orders.length ? "var(--accent)" : null;
+  };
+
+  return (
+    <div style={styles.panel}>
+      <SectionTitle title="Calendar" />
+      <p style={styles.helperText}>
+        {isServiceBiz ? `A day-by-day view of your ${category.orderNounPlural.toLowerCase()} — dated sales already show up here automatically.`
+          : isPropertyBiz ? "Rent due-dates for every occupied property, month by month — green means paid, red means still owing."
+          : `A day-by-day view of your ${category.orderNounPlural.toLowerCase()}.`}
+      </p>
+
+      <div style={styles.dateNavRow}>
+        <button style={styles.dateNavArrow} onClick={() => shiftMonth(-1)}>‹</button>
+        <div style={styles.dateNavCenter}>
+          <div style={styles.dateNavLabel}>{isCurrentMonth ? "This month" : monthDate.toLocaleDateString("default", { month: "long", year: "numeric" })}</div>
+        </div>
+        <button style={styles.dateNavArrow} onClick={() => shiftMonth(1)}>›</button>
+      </div>
+
+      <div style={cs.weekHeader}>
+        {WEEKDAY_LABELS.map((w) => <div key={w} style={cs.weekHeaderCell}>{w}</div>)}
+      </div>
+      <div style={cs.grid}>
+        {cells.map((date, i) => {
+          if (!date) return <div key={i} style={cs.cellEmpty} />;
+          const isToday = isSameDay(today.getTime(), date);
+          const isSelected = isSameDay(selectedDate.getTime(), date);
+          const dot = dotColorForDay(date);
+          return (
+            <button key={i} style={{ ...cs.cell, ...(isToday ? cs.cellToday : {}), ...(isSelected ? cs.cellSelected : {}) }}
+              onClick={() => setSelectedDate(date)}>
+              <span style={cs.cellNum}>{date.getDate()}</span>
+              {dot && <span style={{ ...cs.cellDot, background: dot }} />}
+            </button>
+          );
+        })}
+      </div>
+
+      <SectionTitle title={selectedDate.toLocaleDateString("default", { weekday: "long", month: "short", day: "numeric" })} small />
+
+      {isPropertyBiz ? (
+        selectedProperties.length === 0 ? (
+          <EmptyState text="No rent due on this date." icon={CalendarClock} />
+        ) : (
+          <div style={styles.list}>
+            {selectedProperties.map(({ property, paid }) => (
+              <div key={property.id} style={styles.listRow}>
+                <div>
+                  <div style={styles.listRowTitle}>{property.name}</div>
+                  <div style={styles.listRowSub}>Tenant: {property.meta} · {currency(property.price)}/month</div>
+                </div>
+                <span style={{ ...styles.badge, background: paid ? "var(--accent-soft)" : "rgba(178,58,46,0.12)", color: paid ? "var(--accent)" : "#B23A2E" }}>
+                  {paid ? "Paid" : "Due"}
+                </span>
+              </div>
+            ))}
+          </div>
+        )
+      ) : (
+        selectedOrders.length === 0 ? (
+          <EmptyState text={`No ${category.orderNounPlural.toLowerCase()} on this date.`} icon={isServiceBiz ? CalendarClock : Receipt} />
+        ) : (
+          <div style={styles.list}>
+            {selectedOrders.map((o) => (
+              <div key={o.id} style={styles.listRow}>
+                <div>
+                  <div style={styles.listRowTitle}>{o.customerName || "Walk-in"}</div>
+                  <div style={styles.listRowSub}>{o.quickSale ? (o.items[0]?.name || "Quick sale") : o.items.map((i) => `${i.qty}× ${i.name}`).join(", ")}</div>
+                </div>
+                <div style={styles.mono}>{currency(o.total)}</div>
+              </div>
+            ))}
+          </div>
+        )
+      )}
+
+      {isServiceBiz && (
+        <p style={{ ...styles.helperText, marginTop: 12 }}>
+          To schedule a future {category.orderNoun.toLowerCase()}, create it from the {category.orderNounPlural} tab and set its date ahead — it'll appear here on that day.
+        </p>
+      )}
+    </div>
+  );
+}
+
+/* =========================================================
    REPORTS (owner only)
    ========================================================= */
 function ReportsPanel({ biz, category, setTab }) {
@@ -4474,6 +5129,14 @@ function ReportsPanel({ biz, category, setTab }) {
       Object.entries(byPaymentType).sort((a, b) => b[1] - a[1]).map(([m, amt]) => ({ "Payment type": m, Sales: amt }))
     );
     XLSX.utils.book_append_sheet(wb, byPaymentSheet, "Sales by payment type");
+
+    const quotesSheet = XLSX.utils.json_to_sheet(
+      (biz.quotes || []).map((q) => ({
+        Code: q.code, Customer: q.customerName || "", Total: q.total, Status: q.status,
+        Created: new Date(q.ts).toLocaleDateString(), "Valid until": new Date(q.validUntil).toLocaleDateString(),
+      }))
+    );
+    XLSX.utils.book_append_sheet(wb, quotesSheet, "Quotes");
 
     const filename = `${biz.profile.name.replace(/[^a-z0-9]/gi, "_")}_Report_${now.toLocaleString("default", { month: "short" })}_${now.getFullYear()}.xlsx`;
     XLSX.writeFile(wb, filename);
@@ -5528,6 +6191,8 @@ function HelpPanel({ setTab }) {
     { q: "How do I add a new item or product?", a: `Go to ${"the Items tab"} and tap the + button. Fill in the name, price, and stock if you track it.` },
     { q: "How do I add a staff member?", a: "Go to Staff & HR (under More on phones, or the sidebar on desktop) and tap Add staff. You can assign them a role and a branch." },
     { q: "Why can't I see Accounting or Marketing?", a: "Those are paid add-ons. Check Packages & Billing to activate them, or see if your free trial is still active." },
+    { q: "How do I give a customer a price quote before they buy?", a: "Use the Quotes & Estimates tab — build the quote from your items (or one-off lines like delivery), share it, then convert it to a real sale once they accept." },
+    { q: "How do I see my bookings or rent due-dates on a calendar?", a: "Open the Calendar tab. Service businesses see bookings by day; Property businesses see rent due-dates, marked paid or overdue." },
     { q: "Where is my data stored?", a: "Right now, everything is saved on this device only, in this browser. It won't appear if you open the app on a different phone or computer — a real backend (coming later) will fix that." },
   ];
   return (
@@ -5705,6 +6370,8 @@ function MorePanel({ isOwner, isManager, currentEmployee, category, setTab }) {
       title: "Sales & customers",
       color: "#1B4332",
       rows: [
+        { id: "quotes", label: "Quotes & Estimates", icon: ClipboardList, desc: "Give a formal price before a sale, then convert it once accepted", show: true },
+        { id: "calendar", label: "Calendar", icon: CalendarClock, desc: category.id === "property" ? "Rent due-dates, paid vs overdue, month by month" : `Your ${category.orderNounPlural.toLowerCase()} laid out day by day`, show: true },
         { id: "customers", label: category.customerNounPlural, icon: Users, desc: `Everyone who's had ${article(category.orderNoun)} ${category.orderNoun.toLowerCase()} with you`, show: true },
         { id: "calculator", label: "Price calculator", icon: Calculator, desc: "Work out tax & discount, set defaults", show: true },
       ],
@@ -5715,6 +6382,7 @@ function MorePanel({ isOwner, isManager, currentEmployee, category, setTab }) {
       rows: [
         { id: "activity", label: "Activity", icon: CalendarDays, desc: "Daily, weekly & monthly sales and expenses", show: has("reports") },
         { id: "expenses", label: "Expenses", icon: TrendingDown, desc: "Buying costs, damages/loss, money going out", show: has("reports") },
+        { id: "suppliers", label: "Suppliers", icon: Truck, desc: "Contacts and running spend for who you restock from", show: has("reports") },
       ],
     },
     {
@@ -5800,7 +6468,7 @@ function BottomNav({ tab, setTab, isOwner, unread, category }) {
     { id: "more", label: "More", icon: MoreHorizontal },
   ];
   const activeSet = {
-    more: ["more", "employees", "branches", "customers", "reports", "accounting", "marketing", "documents", "billing", "settings", "calculator", "expenses", "activity", "integrations", "help"],
+    more: ["more", "employees", "branches", "customers", "reports", "accounting", "marketing", "documents", "billing", "settings", "calculator", "expenses", "activity", "integrations", "help", "quotes", "calendar", "suppliers", "businesses"],
   };
   return (
     <div style={styles.bottomNav} className="app-bottom-nav">
@@ -6054,7 +6722,7 @@ const styles = {
   cartTotalRow: { display: "flex", justifyContent: "space-between", fontSize: 14, fontWeight: 700, borderTop: "1px solid var(--line)", marginTop: 6, paddingTop: 6 },
 
   modalOverlay: { position: "fixed", inset: 0, background: "rgba(28,27,23,0.5)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 50, padding: 20 },
-  modalCard: { background: "var(--surface)", borderRadius: 16, padding: 22, width: "100%", maxWidth: 360, fontFamily: "'Inter', sans-serif", boxShadow: "0 20px 50px rgba(0,0,0,0.28)" },
+  modalCard: { background: "var(--surface)", borderRadius: 16, padding: 22, width: "100%", maxWidth: 360, fontFamily: "'Inter', sans-serif", boxShadow: "0 20px 50px rgba(0,0,0,0.28)", maxHeight: "90vh", overflowY: "auto" },
   invoiceHeader: { display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 16, paddingBottom: 14, borderBottom: "1px solid var(--line)" },
   invoiceBrand: { fontFamily: "'Fraunces', serif", fontSize: 17, fontWeight: 700, color: "var(--accent)" },
   invoiceMeta: { fontSize: 11.5, color: "var(--ink-faint)" },
