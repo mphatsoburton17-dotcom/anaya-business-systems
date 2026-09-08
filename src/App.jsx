@@ -454,6 +454,182 @@ function extractDominantColor(dataUrl) {
   });
 }
 
+/* ---------------- flyer canvas helpers (used by MarketingPanel) ---------------- */
+// Loads a data URL (or plain URL) into an <img> for drawImage — resolves to null on
+// failure or a missing src, so callers can just fall back to a placeholder.
+function loadImg(src) {
+  return new Promise((resolve) => {
+    if (!src) { resolve(null); return; }
+    const img = new Image();
+    img.onload = () => resolve(img);
+    img.onerror = () => resolve(null);
+    img.src = src;
+  });
+}
+// Lightens (positive percent, 0–1) or darkens (negative percent, -1–0) a hex color.
+function shadeColor(hex, percent) {
+  const h = (hex || "#1B4332").replace("#", "");
+  let r = parseInt(h.substring(0, 2), 16) || 0, g = parseInt(h.substring(2, 4), 16) || 0, b = parseInt(h.substring(4, 6), 16) || 0;
+  if (percent < 0) { r *= (1 + percent); g *= (1 + percent); b *= (1 + percent); }
+  else { r += (255 - r) * percent; g += (255 - g) * percent; b += (255 - b) * percent; }
+  const clamp = (v) => Math.min(255, Math.max(0, Math.round(v)));
+  return `rgb(${clamp(r)}, ${clamp(g)}, ${clamp(b)})`;
+}
+// Draws a rounded-rectangle path (doesn't fill/stroke — caller does that after).
+function roundRectPath(ctx, x, y, w, h, r) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.lineTo(x + w - r, y);
+  ctx.arcTo(x + w, y, x + w, y + r, r);
+  ctx.lineTo(x + w, y + h - r);
+  ctx.arcTo(x + w, y + h, x + w - r, y + h, r);
+  ctx.lineTo(x + r, y + h);
+  ctx.arcTo(x, y + h, x, y + h - r, r);
+  ctx.lineTo(x, y + r);
+  ctx.arcTo(x, y, x + r, y, r);
+  ctx.closePath();
+}
+// Word-wraps text onto the canvas starting at (x,y), returns the y position after the
+// last line drawn. Truncates with an ellipsis if it would run past maxLines.
+function wrapCanvasText(ctx, text, x, y, maxWidth, lineHeight, maxLines) {
+  const words = (text || "").split(" ").filter(Boolean);
+  if (!words.length) return y;
+  let line = "", lines = [];
+  for (let n = 0; n < words.length; n++) {
+    const testLine = line ? `${line} ${words[n]}` : words[n];
+    if (ctx.measureText(testLine).width > maxWidth && line) { lines.push(line); line = words[n]; }
+    else line = testLine;
+  }
+  lines.push(line);
+  if (maxLines && lines.length > maxLines) {
+    lines = lines.slice(0, maxLines);
+    lines[maxLines - 1] = lines[maxLines - 1].replace(/\s*\S*$/, "") + "…";
+  }
+  lines.forEach((l, i) => ctx.fillText(l, x, y + i * lineHeight));
+  return y + lines.length * lineHeight;
+}
+
+// Renders a full flyer onto the given canvas element from plain data — logo, brand
+// color, headline, price badge, up to a few selling points, and a bottom contact bar.
+// Everything is drawn with the canvas API (no image-generation service, no extra
+// library), so a photo is optional: without one, the photo panel becomes a soft
+// brand-color gradient instead of leaving a gap.
+async function drawFlyer(canvas, opts) {
+  const { businessName, tagline, logoSrc, headline, subheadline, description, priceLabel, priceUnit, features, photoSrc, phone, location, color } = opts;
+  const W = 1080, H = 1620;
+  canvas.width = W; canvas.height = H;
+  const ctx = canvas.getContext("2d");
+  const accent = color || "#1B4332";
+  const accentDark = shadeColor(accent, -0.35);
+  const accentSoft = shadeColor(accent, 0.85);
+
+  ctx.fillStyle = "#FFFFFF";
+  ctx.fillRect(0, 0, W, H);
+
+  const [logoImg, photoImg] = await Promise.all([loadImg(logoSrc), loadImg(photoSrc)]);
+
+  // Photo panel, top-right
+  const photoX = W * 0.46, photoY = 44, photoW = W - photoX - 44, photoH = H * 0.4;
+  roundRectPath(ctx, photoX, photoY, photoW, photoH, 44);
+  ctx.save(); ctx.clip();
+  if (photoImg) {
+    const scale = Math.max(photoW / photoImg.width, photoH / photoImg.height);
+    const iw = photoImg.width * scale, ih = photoImg.height * scale;
+    ctx.drawImage(photoImg, photoX + (photoW - iw) / 2, photoY + (photoH - ih) / 2, iw, ih);
+  } else {
+    const grad = ctx.createLinearGradient(photoX, photoY, photoX + photoW, photoY + photoH);
+    grad.addColorStop(0, accent); grad.addColorStop(1, accentDark);
+    ctx.fillStyle = grad; ctx.fillRect(photoX, photoY, photoW, photoH);
+    ctx.font = "150px sans-serif"; ctx.textAlign = "center"; ctx.textBaseline = "middle";
+    ctx.fillStyle = "rgba(255,255,255,0.55)"; ctx.fillText("🌿", photoX + photoW / 2, photoY + photoH / 2);
+    ctx.textAlign = "left"; ctx.textBaseline = "alphabetic";
+  }
+  ctx.restore();
+  ctx.lineWidth = 6; ctx.strokeStyle = "#fff"; roundRectPath(ctx, photoX, photoY, photoW, photoH, 44); ctx.stroke();
+
+  // Header: logo + business name + tagline
+  const headX = 44, headY = 54;
+  if (logoImg) {
+    ctx.save(); roundRectPath(ctx, headX, headY, 92, 92, 18); ctx.clip();
+    ctx.drawImage(logoImg, headX, headY, 92, 92); ctx.restore();
+  } else {
+    ctx.fillStyle = accent; roundRectPath(ctx, headX, headY, 92, 92, 18); ctx.fill();
+    ctx.fillStyle = "#fff"; ctx.font = "bold 46px sans-serif"; ctx.textAlign = "center"; ctx.textBaseline = "middle";
+    ctx.fillText((businessName || "A")[0].toUpperCase(), headX + 46, headY + 48);
+    ctx.textAlign = "left"; ctx.textBaseline = "alphabetic";
+  }
+  ctx.fillStyle = accentDark; ctx.font = "bold 44px Georgia, serif";
+  ctx.fillText(businessName || "Your Business", headX + 112, headY + 50);
+  if (tagline) {
+    ctx.fillStyle = "#6B7280"; ctx.font = "bold 19px sans-serif";
+    ctx.fillText(tagline.toUpperCase(), headX + 112, headY + 78);
+  }
+
+  // Headline
+  let y = headY + 175;
+  ctx.fillStyle = "#101828"; ctx.font = "bold 74px sans-serif";
+  y = wrapCanvasText(ctx, (headline || "Your product").toUpperCase(), headX, y, photoX - headX - 24, 78, 3);
+
+  // Subheadline banner
+  if (subheadline) {
+    y += 18;
+    ctx.font = "bold 32px sans-serif";
+    const w = Math.min(ctx.measureText(subheadline.toUpperCase()).width + 56, photoX - headX - 24);
+    ctx.fillStyle = accent; roundRectPath(ctx, headX, y, w, 62, 31); ctx.fill();
+    ctx.fillStyle = "#fff"; ctx.textBaseline = "middle";
+    ctx.fillText(subheadline.toUpperCase(), headX + 28, y + 32);
+    ctx.textBaseline = "alphabetic";
+    y += 96;
+  } else {
+    y += 24;
+  }
+
+  // Description — once we're clear of the photo panel, use the full width
+  const descY = Math.max(y, photoY + photoH + 56);
+  ctx.fillStyle = "#374151"; ctx.font = "29px sans-serif";
+  let curY = description ? wrapCanvasText(ctx, description, headX, descY, W - headX * 2, 38, 3) : descY;
+
+  // Price badge, overlapping the bottom-left corner of the photo panel
+  if (priceLabel) {
+    const bx = photoX + 14, by = photoY + photoH - 6, br = 108;
+    ctx.beginPath(); ctx.arc(bx, by, br, 0, Math.PI * 2); ctx.fillStyle = accent; ctx.fill();
+    ctx.lineWidth = 6; ctx.strokeStyle = "#fff"; ctx.stroke();
+    ctx.fillStyle = "#fff"; ctx.textAlign = "center"; ctx.textBaseline = "middle";
+    ctx.font = "bold 52px sans-serif"; ctx.fillText(priceLabel, bx, by - 12);
+    if (priceUnit) { ctx.font = "bold 24px sans-serif"; ctx.fillText(priceUnit.toUpperCase(), bx, by + 28); }
+    ctx.textAlign = "left"; ctx.textBaseline = "alphabetic";
+  }
+
+  // Feature rows — icon circle + text pill
+  let fy = curY + 36;
+  const iconR = 40;
+  (features || []).filter((f) => f && f.trim()).slice(0, 4).forEach((f) => {
+    ctx.beginPath(); ctx.arc(headX + iconR, fy + iconR, iconR, 0, Math.PI * 2); ctx.fillStyle = accent; ctx.fill();
+    ctx.fillStyle = "#fff"; ctx.font = "38px sans-serif"; ctx.textAlign = "center"; ctx.textBaseline = "middle";
+    ctx.fillText("✓", headX + iconR, fy + iconR + 2);
+    ctx.textAlign = "left"; ctx.textBaseline = "alphabetic";
+    const pillX = headX + iconR * 2 + 18, pillW = W - pillX - 44, pillH = iconR * 2;
+    ctx.fillStyle = accentSoft; roundRectPath(ctx, pillX, fy, pillW, pillH, pillH / 2); ctx.fill();
+    ctx.fillStyle = accentDark; ctx.font = "bold 30px sans-serif"; ctx.textBaseline = "middle";
+    wrapCanvasText(ctx, f.trim(), pillX + 30, fy + pillH / 2 + 2, pillW - 60, 34, 1);
+    ctx.textBaseline = "alphabetic";
+    fy += pillH + 18;
+  });
+
+  // Bottom contact bar
+  const barH = 108, barY = H - 216;
+  ctx.fillStyle = accentDark; ctx.fillRect(0, barY, W, barH);
+  ctx.fillStyle = "#fff"; ctx.font = "32px sans-serif"; ctx.textBaseline = "middle";
+  ctx.fillText(`📍 ${location || "Add your location in Settings"}`, 46, barY + barH / 2);
+  ctx.textBaseline = "alphabetic";
+
+  // Footer strip — big phone number
+  ctx.fillStyle = "#101828"; ctx.fillRect(0, H - 108, W, 108);
+  ctx.fillStyle = "#fff"; ctx.font = "bold 50px sans-serif"; ctx.textAlign = "center";
+  ctx.fillText(`📞 ${phone || "Add your phone number in Settings"}`, W / 2, H - 44);
+  ctx.textAlign = "left";
+}
+
 // ---------------- Supabase-backed account + business storage ----------------
 // Real Supabase Auth session replaces the old ACCOUNTS_KEY/SESSION_KEY
 // localStorage bookkeeping. The whole `biz` object (items, orders, staff,
@@ -661,6 +837,24 @@ async function checkPayChanguReturn() {
   const { data, error } = await supabase.functions.invoke("paychangu-verify", { body: { tx_ref: txRef } });
   const succeeded = !error && data?.status === "success";
   return { succeeded, pendingRecord, status: data?.status || "error" };
+}
+
+// ---------------- AI Assist (Supabase Edge Function) ----------------
+// One shared entry point used by the Flyer maker, Documents, Budget, and Content
+// Ideas to ask Claude for help. The actual API call happens server-side in the
+// "ai-assist" Supabase Edge Function — see the separate function file — so the
+// Anthropic API key never reaches the browser, the same pattern PayChangu uses above.
+// If that function isn't deployed yet (or has no API key configured), this just
+// returns a friendly error instead of throwing.
+async function callAiAssist(kind, input) {
+  try {
+    const { data, error } = await supabase.functions.invoke("ai-assist", { body: { kind, input } });
+    if (error) return { ok: false, error: "AI assist isn't set up yet for this business. Ask whoever manages your Supabase account to add it." };
+    if (!data || data.error) return { ok: false, error: data?.error || "AI assist didn't return a result — please try again." };
+    return { ok: true, data };
+  } catch {
+    return { ok: false, error: "Couldn't reach the AI assist service. Please try again." };
+  }
 }
 
 export default function App() {
@@ -996,7 +1190,7 @@ export default function App() {
         )}
         {tab === "marketing" && (isOwner || isManager || hasModuleAccess(currentEmployee, "marketing")) && (
           hasPackage(biz, "growth")
-            ? <MarketingPanel setTab={setTab} />
+            ? <MarketingPanel biz={biz} category={category} setTab={setTab} />
             : <PaywallScreen packageId="growth" setTab={setTab} />
         )}
         {tab === "documents" && (isOwner || isManager || hasModuleAccess(currentEmployee, "marketing")) && (
@@ -6413,6 +6607,21 @@ function BudgetDetail({ biz, persist, notify, budget, onBack, onDelete }) {
 
   const monthEntries = budgetMonthEntries(budget, monthDate).sort((a, b) => b.ts - a.ts);
 
+  const [aiAdvice, setAiAdvice] = useState("");
+  const [aiAdviceBusy, setAiAdviceBusy] = useState(false);
+  const [aiAdviceError, setAiAdviceError] = useState("");
+
+  const getAiAdvice = async () => {
+    setAiAdviceBusy(true); setAiAdviceError(""); setAiAdvice("");
+    const result = await callAiAssist("budget_advice", {
+      budgetName: budget.name,
+      categories: budget.categories.map((c) => ({ name: c.name, planned: c.planned, spent: spentByCat[c.id] || 0 })),
+    });
+    setAiAdviceBusy(false);
+    if (!result.ok) { setAiAdviceError(result.error); return; }
+    setAiAdvice(result.data.text || "");
+  };
+
   return (
     <div style={styles.panel}>
       <BackRow onBack={onBack} label="Budgets" />
@@ -6456,6 +6665,12 @@ function BudgetDetail({ biz, persist, notify, budget, onBack, onDelete }) {
         <StatCard label={view === "month" ? "Planned this month" : "Planned so far this year"} value={currency(view === "month" ? totalPlanned : yearTotalPlanned)} />
         <StatCard label="Actual spent" value={currency(view === "month" ? totalSpent : yearTotalSpent)} />
       </div>
+
+      <button style={{ ...styles.smallAddBtn, marginBottom: 12 }} disabled={aiAdviceBusy} onClick={getAiAdvice}>
+        <Sparkles size={14} style={{ marginRight: 4, verticalAlign: "text-bottom" }} /> {aiAdviceBusy ? "Thinking…" : "Get AI advice on this budget"}
+      </button>
+      {aiAdviceError && <div style={styles.authError}>{aiAdviceError}</div>}
+      {aiAdvice && <Callout icon={Sparkles} tone="info">{aiAdvice}</Callout>}
 
       <SectionTitle title="By category" small />
       <div style={styles.list}>
@@ -6569,36 +6784,187 @@ function AlertsPanel({ biz, persist }) {
 /* =========================================================
    MARKETING (placeholder — needs external services)
    ========================================================= */
-function MarketingPanel({ setTab }) {
+function MarketingPanel({ biz, category, setTab }) {
+  const branding = biz.profile.branding || {};
+  const [productId, setProductId] = useState("");
+  const [headline, setHeadline] = useState("");
+  const [subheadline, setSubheadline] = useState("");
+  const [description, setDescription] = useState("");
+  const [priceLabel, setPriceLabel] = useState("");
+  const [priceUnit, setPriceUnit] = useState("");
+  const [features, setFeatures] = useState(["", "", ""]);
+  const [photoDataUrl, setPhotoDataUrl] = useState(null);
+  const canvasRef = useRef(null);
+
+  const [aiRequest, setAiRequest] = useState("");
+  const [aiBusy, setAiBusy] = useState(false);
+  const [aiError, setAiError] = useState("");
+
+  const [ideas, setIdeas] = useState([]);
+  const [ideasBusy, setIdeasBusy] = useState(false);
+  const [ideasError, setIdeasError] = useState("");
+
+  const applyProduct = (id) => {
+    setProductId(id);
+    const item = biz.items.find((i) => i.id === id);
+    if (item) {
+      setHeadline(item.name);
+      setPriceLabel(currency(item.price).replace("MWK ", "K"));
+      setPriceUnit(category.hasStock && item.unit && item.unit !== "pcs" ? `per ${item.unit}` : "each");
+    }
+  };
+
+  const onPhotoFile = async (e) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    const raw = await fileToDataUrl(file);
+    setPhotoDataUrl(await resizeDataUrl(raw, 900));
+  };
+  const setFeature = (idx, val) => setFeatures((f) => f.map((x, i) => (i === idx ? val : x)));
+
+  // Sends a short plain-English request (e.g. "simple flyer for rice bags", "detailed
+  // flyer with selling points") to the shared AI helper, and fills the form from what
+  // comes back. The price stays under your control — AI only writes the wording.
+  const generateWithAI = async () => {
+    if (!aiRequest.trim()) return;
+    setAiBusy(true); setAiError("");
+    const result = await callAiAssist("flyer", {
+      request: aiRequest.trim(),
+      businessType: category.name,
+      productName: headline || biz.items.find((i) => i.id === productId)?.name || "",
+    });
+    setAiBusy(false);
+    if (!result.ok) { setAiError(result.error); return; }
+    if (result.data.headline) setHeadline(result.data.headline);
+    if (result.data.subheadline) setSubheadline(result.data.subheadline);
+    if (result.data.description) setDescription(result.data.description);
+    if (Array.isArray(result.data.features)) setFeatures([result.data.features[0] || "", result.data.features[1] || "", result.data.features[2] || ""]);
+  };
+
+  const suggestIdeas = async () => {
+    setIdeasBusy(true); setIdeasError("");
+    const result = await callAiAssist("content_ideas", { businessType: category.businessSubtypeName || category.name, businessName: biz.profile.name });
+    setIdeasBusy(false);
+    if (!result.ok) { setIdeasError(result.error); return; }
+    setIdeas(Array.isArray(result.data.ideas) ? result.data.ideas : []);
+  };
+
+  useEffect(() => {
+    if (!canvasRef.current) return;
+    drawFlyer(canvasRef.current, {
+      businessName: biz.profile.name,
+      tagline: biz.profile.businessSubtypeName || category.name,
+      logoSrc: branding.logo,
+      headline: headline || `Your ${category.itemLabel.toLowerCase()}`,
+      subheadline, description, priceLabel, priceUnit, features,
+      photoSrc: photoDataUrl,
+      phone: biz.profile.phone, location: biz.profile.location,
+      color: branding.primaryColor || category.theme.accent,
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [headline, subheadline, description, priceLabel, priceUnit, features, photoDataUrl, biz.profile.name, biz.profile.phone, biz.profile.location]);
+
+  const downloadFlyer = () => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const link = document.createElement("a");
+    link.download = `${(biz.profile.name || "flyer").replace(/[^a-z0-9]/gi, "_")}_flyer.png`;
+    link.href = canvas.toDataURL("image/png");
+    link.click();
+  };
+
+  const shareFlyer = () => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    canvas.toBlob(async (blob) => {
+      if (!blob) return;
+      try {
+        const file = new File([blob], "flyer.png", { type: "image/png" });
+        if (navigator.canShare && navigator.canShare({ files: [file] })) {
+          await navigator.share({ files: [file], title: headline || "Flyer" });
+          return;
+        }
+      } catch (e) {
+        if (e?.name === "AbortError") return;
+      }
+      downloadFlyer();
+      alert("Your device can't share images directly from here — the flyer has been downloaded instead. Attach it from your photos/downloads to WhatsApp or Facebook.");
+    }, "image/png");
+  };
+
   return (
     <div style={styles.panel}>
       <BackRow onBack={() => setTab("more")} label="More" />
       <SectionTitle title="Marketing" />
-      <Callout icon={Megaphone} tone="info">
-        This is where flyer generation and a content calendar will live. You'll generate the content here,
-        then share it yourself to WhatsApp, Facebook, or wherever you like — the Share button already
-        works this way on Receipts and Documents.
-      </Callout>
-      <div style={styles.list}>
-        <div style={styles.listRow}>
-          <div>
-            <div style={styles.listRowTitle}>Flyer generator</div>
-            <div style={styles.listRowSub}>Template-based flyers (logo, colors, product, price) work with no extra setup. Nicer AI-generated visuals need an image-generation API connected once the backend is built.</div>
-          </div>
-        </div>
-        <div style={styles.listRow}>
-          <div>
-            <div style={styles.listRowTitle}>Share to WhatsApp / Facebook</div>
-            <div style={styles.listRowSub}>Uses your phone's own share sheet — no account setup, no approval process. Tap Share, pick the app.</div>
-          </div>
-        </div>
-        <div style={styles.listRow}>
-          <div>
-            <div style={styles.listRowTitle}>Content calendar</div>
-            <div style={styles.listRowSub}>Plan what to post and when — coming soon.</div>
-          </div>
-        </div>
+      <p style={styles.helperText}>Build a flyer using your logo, brand color, and a product's details, then share it straight to WhatsApp or Facebook.</p>
+
+      <div style={styles.formCard}>
+        <div style={styles.miniLabel}>Ask AI to write it for you (optional)</div>
+        <textarea style={styles.textArea} rows={2} placeholder='e.g. "simple flyer for rice bags" or "detailed flyer with selling points and price"'
+          value={aiRequest} onChange={(e) => setAiRequest(e.target.value)} />
+        <button style={{ ...styles.primaryBtnSmall, opacity: aiRequest.trim() ? 1 : 0.5 }} disabled={!aiRequest.trim() || aiBusy} onClick={generateWithAI}>
+          <Sparkles size={16} /> {aiBusy ? "Writing…" : "Generate with AI"}
+        </button>
+        {aiError && <div style={styles.authError}>{aiError}</div>}
       </div>
+
+      <div style={styles.formCard}>
+        {biz.items.length > 0 && (
+          <select style={styles.textInput} value={productId} onChange={(e) => applyProduct(e.target.value)}>
+            <option value="">Start from a {category.itemLabel.toLowerCase()}… (optional)</option>
+            {biz.items.map((i) => <option key={i.id} value={i.id}>{i.name}</option>)}
+          </select>
+        )}
+        <input style={styles.textInput} placeholder="Headline (e.g. Fresh Tomato Seedlings)" value={headline} onChange={(e) => setHeadline(e.target.value)} />
+        <input style={styles.textInput} placeholder="Short banner text (optional, e.g. Tengeru Select)" value={subheadline} onChange={(e) => setSubheadline(e.target.value)} />
+        <textarea style={styles.textArea} rows={2} placeholder="Short description" value={description} onChange={(e) => setDescription(e.target.value)} />
+        <div style={styles.formRow}>
+          <input style={styles.textInputHalf} placeholder="Price (e.g. K50)" value={priceLabel} onChange={(e) => setPriceLabel(e.target.value)} />
+          <input style={styles.textInputHalf} placeholder="Unit (e.g. each, per kg)" value={priceUnit} onChange={(e) => setPriceUnit(e.target.value)} />
+        </div>
+        <div style={styles.miniLabel}>Selling points (up to 3)</div>
+        {features.map((f, i) => (
+          <input key={i} style={styles.textInput} placeholder={`Selling point ${i + 1}`} value={f} onChange={(e) => setFeature(i, e.target.value)} />
+        ))}
+        <div style={styles.miniLabel}>Photo (optional)</div>
+        <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 4 }}>
+          {photoDataUrl && <img src={photoDataUrl} alt="" style={{ width: 56, height: 56, borderRadius: 10, objectFit: "cover", border: "1px solid var(--line)" }} />}
+          <label style={{ ...styles.smallAddBtn, display: "inline-block" }}>
+            {photoDataUrl ? "Change photo" : "Upload photo"}
+            <input type="file" accept="image/*" style={{ display: "none" }} onChange={onPhotoFile} />
+          </label>
+        </div>
+        {(!biz.profile.phone || !biz.profile.location) && (
+          <p style={{ ...styles.helperText, marginTop: 12, marginBottom: 0 }}>Tip: add your phone number and location in Settings so they show on the flyer.</p>
+        )}
+      </div>
+
+      <SectionTitle title="Preview" small />
+      <div style={{ background: "var(--bg)", borderRadius: 14, padding: 14, marginBottom: 16, display: "flex", justifyContent: "center" }}>
+        <canvas ref={canvasRef} style={{ width: "100%", maxWidth: 320, borderRadius: 10, boxShadow: "0 10px 30px rgba(16,24,40,0.15)" }} />
+      </div>
+
+      <div style={{ display: "flex", gap: 8 }}>
+        <button style={{ ...styles.primaryBtnSmall, flex: 1 }} onClick={downloadFlyer}><Download size={16} /> Download</button>
+        <button style={{ ...styles.printBtn, flex: 1, marginTop: 0 }} onClick={shareFlyer}><Share2 size={15} /> Share</button>
+      </div>
+
+      <SectionTitle title="Content ideas" small />
+      <p style={styles.helperText}>A handful of quick post ideas for WhatsApp Status or Facebook, based on your business — tap Share to send one straight out.</p>
+      <button style={{ ...styles.primaryBtnSmall, marginBottom: 12 }} disabled={ideasBusy} onClick={suggestIdeas}>
+        <Sparkles size={16} /> {ideasBusy ? "Thinking…" : ideas.length ? "Suggest new ideas" : "Suggest post ideas"}
+      </button>
+      {ideasError && <div style={styles.authError}>{ideasError}</div>}
+      {ideas.length > 0 && (
+        <div style={styles.list}>
+          {ideas.map((idea, i) => (
+            <div key={i} style={styles.listRow}>
+              <div style={{ flex: 1 }}><div style={styles.listRowTitle}>{idea}</div></div>
+              <button style={styles.iconBtn} title="Share" onClick={() => shareText("Post idea", idea)}><Share2 size={15} /></button>
+            </div>
+          ))}
+        </div>
+      )}
     </div>
   );
 }
@@ -6747,6 +7113,22 @@ function DocumentsPanel({ biz, category, persist, setTab, canEditBranding = true
   const people = template.forWhom === "employee" ? biz.employees : biz.customers;
   const isLeaseTemplate = templateId === "lease";
 
+  const [aiDraftInput, setAiDraftInput] = useState("");
+  const [aiDrafting, setAiDrafting] = useState(false);
+  const [aiDraftError, setAiDraftError] = useState("");
+
+  // Drafts just the middle section of the letter (the "extra" text below) from a short
+  // description of the situation — the rest of the template (names, business name,
+  // signature) stays exactly as it already works.
+  const draftWithAI = async () => {
+    if (!aiDraftInput.trim()) return;
+    setAiDrafting(true); setAiDraftError("");
+    const result = await callAiAssist("letter", `Letter type: ${template.label}. Situation: ${aiDraftInput.trim()}`);
+    setAiDrafting(false);
+    if (!result.ok) { setAiDraftError(result.error); return; }
+    setExtra(result.data.text || "");
+  };
+
   const generate = () => {
     const person = people.find((p) => p.id === personId);
     const property = isLeaseTemplate ? biz.items.find((i) => i.id === propertyId) : null;
@@ -6884,6 +7266,16 @@ function DocumentsPanel({ biz, category, persist, setTab, canEditBranding = true
             ))}
           </select>
         )}
+
+        <div style={styles.miniLabel}>Ask AI to draft this section (optional)</div>
+        <div style={styles.formRow}>
+          <input style={{ ...styles.textInput, flex: 1, marginBottom: 0 }} placeholder="Describe the situation…" value={aiDraftInput} onChange={(e) => setAiDraftInput(e.target.value)} />
+          <button style={styles.smallAddBtn} disabled={!aiDraftInput.trim() || aiDrafting} onClick={draftWithAI}>
+            {aiDrafting ? "…" : "Draft"}
+          </button>
+        </div>
+        {aiDraftError && <div style={styles.authError}>{aiDraftError}</div>}
+
         <textarea style={styles.textArea} placeholder={isLeaseTemplate ? "Add specific lease terms (optional) — deposit amount, lease length, house rules…" : "Add specific details (optional) — reason, dates, performance notes…"}
           value={extra} onChange={(e) => setExtra(e.target.value)} rows={3} />
         <button style={styles.primaryBtnSmall} onClick={generate}>
