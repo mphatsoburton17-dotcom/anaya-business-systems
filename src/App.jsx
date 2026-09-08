@@ -7,7 +7,7 @@ import {
   CalendarDays, Lock, Mail, BookOpen, Wallet, HandCoins, Puzzle, HelpCircle, Phone, MessageCircle,
   Sparkles, Building2, Smartphone, Layers, Pencil, Share2,
   ShoppingCart, Shirt, Hammer, Sofa, Pill, Wheat, GraduationCap, UtensilsCrossed, Cookie, Beer, Car,
-  ClipboardList, Truck, CalendarClock, ChevronLeft
+  ClipboardList, Truck, CalendarClock, ChevronLeft, PiggyBank, PackageCheck, ScanLine
 } from "lucide-react";
 import * as XLSX from "xlsx";
 import { supabase } from "./supabaseClient";
@@ -587,6 +587,9 @@ function emptyBusiness(name, categoryId, details = {}) {
     expenses: [],
     restocks: [], // stock-in / purchase history: what was bought from suppliers, at what cost
     billingRequests: [], // "I've paid, here's proof" submissions — see BillingPanel
+    personalBudgets: [], // owner-only personal/family budgets — entirely separate from the business's own numbers
+    recurringExpenses: [], // templates that auto-log a regular expense (rent, subscriptions) once per month
+    purchaseOrders: [], // formal orders sent to a supplier before goods arrive — the buying-side mirror of Quotes
     settings: { theme: "light", taxRate: 0, discountRate: 0, activeBranchId: null },
   };
 }
@@ -689,6 +692,9 @@ export default function App() {
       billingRequests: biz_.billingRequests || [],
       quotes: biz_.quotes || [],
       suppliers: biz_.suppliers || [],
+      personalBudgets: biz_.personalBudgets || [],
+      recurringExpenses: biz_.recurringExpenses || [],
+      purchaseOrders: biz_.purchaseOrders || [],
       expenses: (biz_.expenses || []).map((e) => ({ branchId: defaultBranchId, ...e })),
       orders: (biz_.orders || []).map((o) => ({ branchId: defaultBranchId, ...o })),
       branches,
@@ -866,6 +872,35 @@ export default function App() {
     return () => { cancelled = true; };
   }, [biz, account, notify, loadActiveBiz]);
 
+  // Auto-logs any recurring expense templates (rent, subscriptions, etc.) that are due
+  // and haven't been logged yet this month. Runs once per session, right after the
+  // business loads — the lastLoggedMonth guard on each template makes this idempotent,
+  // so there's no risk of double-logging even if this effect re-fires.
+  const recurringCheckedRef = useRef(false);
+  useEffect(() => {
+    if (!biz || !account || recurringCheckedRef.current) return;
+    const recurring = biz.recurringExpenses || [];
+    if (!recurring.length) { recurringCheckedRef.current = true; return; }
+    recurringCheckedRef.current = true;
+    const now = new Date();
+    const monthKey = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}`;
+    let next = { ...biz };
+    let loggedCount = 0;
+    const updatedRecurring = recurring.map((r) => {
+      if (!r.active || r.lastLoggedMonth === monthKey || now.getDate() < (r.dayOfMonth || 1)) return r;
+      const ts = new Date(now.getFullYear(), now.getMonth(), Math.min(r.dayOfMonth || 1, 28), 12, 0, 0).getTime();
+      const exp = { id: uid("exp"), category: r.category, amount: r.amount, note: r.note || "Recurring expense", branchId: r.branchId || null, ts, recurringId: r.id };
+      next = { ...next, expenses: [exp, ...next.expenses] };
+      loggedCount++;
+      return { ...r, lastLoggedMonth: monthKey };
+    });
+    if (loggedCount > 0) {
+      next = { ...next, recurringExpenses: updatedRecurring };
+      next = notify(next, "expense", `${loggedCount} recurring expense${loggedCount > 1 ? "s" : ""} logged automatically for this month.`);
+      persist(next);
+    }
+  }, [biz, account, notify, persist]);
+
   if (loading) {
     return (
       <div style={styles.loadingScreen}>
@@ -938,6 +973,9 @@ export default function App() {
         {tab === "suppliers" && (isOwner || isManager || hasModuleAccess(currentEmployee, "reports")) && (
           <SuppliersPanel biz={biz} category={category} persist={persist} setTab={setTab} />
         )}
+        {tab === "purchaseOrders" && (isOwner || isManager || hasModuleAccess(currentEmployee, "reports")) && (
+          <PurchaseOrdersPanel biz={biz} category={category} persist={persist} notify={notify} setTab={setTab} />
+        )}
         {tab === "employees" && (isOwner || isManager || hasModuleAccess(currentEmployee, "hr")) && (
           <EmployeesPanel biz={biz} category={category} persist={persist} setTab={setTab} currentEmployee={currentEmployee} />
         )}
@@ -976,6 +1014,9 @@ export default function App() {
         )}
         {tab === "businesses" && isOwner && (
           <BusinessesPanel myBusinesses={myBusinesses} biz={biz} switchBusiness={switchBusiness} switchingBusiness={switchingBusiness} setTab={setTab} />
+        )}
+        {tab === "budget" && isOwner && (
+          <BudgetPanel biz={biz} persist={persist} notify={notify} setTab={setTab} />
         )}
         {tab === "calculator" && (
           <CalculatorPanel biz={biz} persist={persist} setTab={setTab} />
@@ -2082,6 +2123,7 @@ function Sidebar({ biz, category, tab, setTab, isOwner, isManager, canSee, unrea
         { id: "activity", label: "Activity", icon: CalendarDays, show: canSee("reports") },
         { id: "expenses", label: "Expenses", icon: TrendingDown, show: canSee("reports") },
         { id: "suppliers", label: "Suppliers", icon: Truck, show: canSee("reports") },
+        { id: "purchaseOrders", label: "Purchase Orders", icon: PackageCheck, show: canSee("reports") },
         { id: "accounting", label: "Accounting", icon: BookOpen, show: canSee("accounting") },
         { id: "reports", label: "Reports", icon: BarChart3, show: canSee("reports") },
       ],
@@ -2098,6 +2140,12 @@ function Sidebar({ biz, category, tab, setTab, isOwner, isManager, canSee, unrea
       rows: [
         { id: "marketing", label: "Marketing", icon: Megaphone, show: canSee("marketing") },
         { id: "documents", label: "Documents", icon: FileText, show: canSee("marketing") },
+      ],
+    },
+    {
+      title: "Personal",
+      rows: [
+        { id: "budget", label: "Budget", icon: PiggyBank, show: isOwner },
       ],
     },
     {
@@ -2527,13 +2575,107 @@ function SectionTitle({ title, small }) {
 }
 
 /* =========================================================
+   BARCODE SCANNER (shared — used by ItemsPanel to register a barcode, and by
+   OrdersPanel to look one up at checkout)
+   Uses the browser's built-in BarcodeDetector API where available (no extra
+   library needed), and falls back to typing the code in by hand everywhere
+   else — iOS Safari and most desktop browsers don't support it yet.
+   ========================================================= */
+function BarcodeScannerModal({ onDetect, onClose }) {
+  const videoRef = useRef(null);
+  const streamRef = useRef(null);
+  const rafRef = useRef(null);
+  const [supported] = useState(() => typeof window !== "undefined" && "BarcodeDetector" in window);
+  const [manualMode, setManualMode] = useState(() => !(typeof window !== "undefined" && "BarcodeDetector" in window));
+  const [manualCode, setManualCode] = useState("");
+  const [cameraError, setCameraError] = useState("");
+
+  useEffect(() => {
+    if (manualMode) return undefined;
+    let cancelled = false;
+    let detector;
+    try {
+      detector = new window.BarcodeDetector({ formats: ["ean_13", "ean_8", "upc_a", "upc_e", "code_128", "code_39", "qr_code"] });
+    } catch {
+      setManualMode(true);
+      return undefined;
+    }
+    navigator.mediaDevices.getUserMedia({ video: { facingMode: "environment" } })
+      .then((stream) => {
+        if (cancelled) { stream.getTracks().forEach((t) => t.stop()); return; }
+        streamRef.current = stream;
+        if (videoRef.current) {
+          videoRef.current.srcObject = stream;
+          videoRef.current.play().catch(() => {});
+        }
+        const tick = async () => {
+          if (cancelled || !videoRef.current) return;
+          try {
+            const codes = await detector.detect(videoRef.current);
+            if (codes.length > 0) {
+              cancelled = true;
+              onDetect(codes[0].rawValue);
+              return;
+            }
+          } catch { /* frame not ready — keep trying next frame */ }
+          rafRef.current = requestAnimationFrame(tick);
+        };
+        rafRef.current = requestAnimationFrame(tick);
+      })
+      .catch(() => {
+        if (!cancelled) { setCameraError("Couldn't access the camera — you can type the barcode instead."); setManualMode(true); }
+      });
+    return () => {
+      cancelled = true;
+      if (rafRef.current) cancelAnimationFrame(rafRef.current);
+      if (streamRef.current) streamRef.current.getTracks().forEach((t) => t.stop());
+    };
+  }, [manualMode, onDetect]);
+
+  const submitManual = () => {
+    if (!manualCode.trim()) return;
+    onDetect(manualCode.trim());
+  };
+
+  return (
+    <div style={styles.modalOverlay} onClick={onClose}>
+      <div style={styles.modalCard} onClick={(e) => e.stopPropagation()}>
+        <div style={styles.invoiceHeader}>
+          <div style={styles.invoiceBrand}>Scan barcode</div>
+          <button style={styles.iconBtn} onClick={onClose}><X size={18} /></button>
+        </div>
+
+        {!manualMode ? (
+          <>
+            <video ref={videoRef} muted playsInline style={{ width: "100%", borderRadius: 10, background: "#000", marginBottom: 12 }} />
+            <p style={styles.helperText}>Point the camera at the barcode — it'll be picked up automatically.</p>
+            <button type="button" style={styles.textLinkBtn} onClick={() => setManualMode(true)}>Type the code instead</button>
+          </>
+        ) : (
+          <>
+            {cameraError && <div style={styles.authError}>{cameraError}</div>}
+            <input style={styles.textInput} placeholder="Enter barcode / SKU" value={manualCode} autoFocus
+              onChange={(e) => setManualCode(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter") submitManual(); }} />
+            <button style={styles.primaryBtnSmall} onClick={submitManual}><Check size={16} /> Use this code</button>
+            {supported && (
+              <button type="button" style={{ ...styles.textLinkBtn, marginTop: 10 }} onClick={() => { setManualMode(false); setCameraError(""); }}>Use camera instead</button>
+            )}
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
+/* =========================================================
    ITEMS (Products / Services)
    ========================================================= */
 function ItemsPanel({ biz, category, persist, notify, isOwner }) {
   const isPharmacy = biz.profile?.businessSubtypeId === "pharmacy";
   const isPropertyBiz = category.id === "property";
   const [showForm, setShowForm] = useState(false);
-  const [form, setForm] = useState({ name: "", price: "", cost: "", stock: "", meta: "", itemCategory: "", unit: "pcs", expiryDate: "", batchNumber: "", requiresPrescription: false, dueDay: "1" });
+  const [form, setForm] = useState({ name: "", price: "", cost: "", stock: "", meta: "", itemCategory: "", unit: "pcs", expiryDate: "", batchNumber: "", requiresPrescription: false, dueDay: "1", barcode: "" });
+  const [showScanner, setShowScanner] = useState(false);
   const [query, setQuery] = useState("");
   const [newTag, setNewTag] = useState("");
   const [restockingId, setRestockingId] = useState(null); // item id currently showing the restock form
@@ -2567,10 +2709,11 @@ function ItemsPanel({ biz, category, persist, notify, isOwner }) {
       batchNumber: isPharmacy && form.batchNumber.trim() ? form.batchNumber.trim() : undefined,
       requiresPrescription: isPharmacy ? !!form.requiresPrescription : undefined,
       dueDay: isPropertyBiz ? (Math.min(28, Math.max(1, Number(form.dueDay) || 1))) : undefined,
+      barcode: category.hasStock && form.barcode.trim() ? form.barcode.trim() : undefined,
     };
     let next = { ...biz, items: [item, ...biz.items] };
     persist(next);
-    setForm({ name: "", price: "", cost: "", stock: "", meta: "", itemCategory: "", unit: "pcs", expiryDate: "", batchNumber: "", requiresPrescription: false, dueDay: "1" });
+    setForm({ name: "", price: "", cost: "", stock: "", meta: "", itemCategory: "", unit: "pcs", expiryDate: "", batchNumber: "", requiresPrescription: false, dueDay: "1", barcode: "" });
     setShowForm(false);
   };
 
@@ -2656,6 +2799,19 @@ function ItemsPanel({ biz, category, persist, notify, isOwner }) {
                   </button>
                 ))}
               </div>
+              <div style={styles.formRow}>
+                <input style={{ ...styles.textInput, flex: 1, marginBottom: 0 }} placeholder="Barcode / SKU (optional)"
+                  value={form.barcode} onChange={(e) => setForm({ ...form, barcode: e.target.value })} />
+                <button type="button" style={styles.smallAddBtn} onClick={() => setShowScanner(true)}>
+                  <ScanLine size={14} style={{ marginRight: 4, verticalAlign: "text-bottom" }} /> Scan
+                </button>
+              </div>
+              {showScanner && (
+                <BarcodeScannerModal
+                  onDetect={(code) => { setForm((f) => ({ ...f, barcode: code })); setShowScanner(false); }}
+                  onClose={() => setShowScanner(false)}
+                />
+              )}
             </>
           )}
 
@@ -2781,6 +2937,7 @@ function ItemsPanel({ biz, category, persist, notify, isOwner }) {
                     })()}
                     {item.batchNumber && <span>{"  ·  "}Batch {item.batchNumber}</span>}
                     {item.requiresPrescription && <span>{"  ·  "}Rx required</span>}
+                    {item.barcode && <span>{"  ·  "}Barcode {item.barcode}</span>}
                   </div>
                 </div>
                 <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
@@ -2889,9 +3046,19 @@ function OrdersPanel({ biz, category, persist, notify, currentEmployee }) {
   const [formError, setFormError] = useState("");
   const [saleDate, setSaleDate] = useState(toDateInputValue(new Date()));
   const [editingOrderId, setEditingOrderId] = useState(null);
+  const [showScanner, setShowScanner] = useState(false);
+  const [scanError, setScanError] = useState("");
   const today = new Date();
 
   const selectedUnit = biz.items.find((i) => i.id === selectedItemId)?.unit || "pcs";
+
+  const handleScan = (code) => {
+    setShowScanner(false);
+    const found = itemsForBranch(biz.items, biz.settings?.activeBranchId).find((i) => i.barcode && i.barcode === code);
+    if (!found) { setScanError(`No ${category.itemLabel.toLowerCase()} found with barcode "${code}".`); return; }
+    setScanError("");
+    setCart((c) => [...c, { itemId: found.id, name: found.name, price: found.price, category: found.category, unit: found.unit, qty: 1 }]);
+  };
 
   const addToCart = () => {
     const item = biz.items.find((i) => i.id === selectedItemId);
@@ -3131,6 +3298,15 @@ function OrdersPanel({ biz, category, persist, notify, currentEmployee }) {
                   placeholder={category.id === "property" ? "Months" : (selectedUnit !== "pcs" ? selectedUnit : "")} value={qty} onChange={(e) => setQty(e.target.value)} />
                 <button style={styles.smallAddBtn} onClick={addToCart}>Add</button>
               </div>
+              {category.hasStock && (
+                <>
+                  <button type="button" style={{ ...styles.textLinkBtn, marginTop: -6, marginBottom: 12, display: "flex", alignItems: "center", gap: 5 }} onClick={() => { setShowScanner(true); setScanError(""); }}>
+                    <ScanLine size={14} /> Scan a barcode to add instantly
+                  </button>
+                  {scanError && <div style={styles.authError}>{scanError}</div>}
+                  {showScanner && <BarcodeScannerModal onDetect={handleScan} onClose={() => setShowScanner(false)} />}
+                </>
+              )}
               {category.id === "property" && (
                 <p style={{ ...styles.helperText, marginTop: -8 }}>Paying for more than one month at once? Set "Months" to 2, 3, or however many are being paid now.</p>
               )}
@@ -4372,9 +4548,13 @@ function ExpensesPanel({ biz, category: bizCategory, persist, setTab, currentEmp
   const [amount, setAmount] = useState("");
   const [note, setNote] = useState("");
   const [expenseDate, setExpenseDate] = useState(toDateInputValue(new Date()));
+  const [showRecurring, setShowRecurring] = useState(false);
+  const [showRecurringForm, setShowRecurringForm] = useState(false);
+  const [recurringForm, setRecurringForm] = useState({ category: expenseCategoryOptions[0], amount: "", dayOfMonth: "1", note: "" });
   const today = new Date();
 
   const branchExpenses = filterByBranch(biz.expenses, biz.settings?.activeBranchId);
+  const recurringExpenses = biz.recurringExpenses || [];
 
   const activeBranch = biz.branches?.find((b) => b.id === biz.settings?.activeBranchId);
   const isLocked = !!(activeBranch?.assignedEmployeeId && activeBranch.assignedEmployeeId !== currentEmployee?.id);
@@ -4392,6 +4572,28 @@ function ExpensesPanel({ biz, category: bizCategory, persist, setTab, currentEmp
   const removeExpense = (id) => {
     if (isLocked) return;
     persist({ ...biz, expenses: biz.expenses.filter((e) => e.id !== id) });
+  };
+
+  // Recurring expense templates — auto-logged once per month by the effect in the main
+  // App component (see recurringCheckedRef there). This panel just creates/edits/removes them.
+  const addRecurring = () => {
+    if (isLocked) return;
+    if (!recurringForm.amount || Number(recurringForm.amount) <= 0) return;
+    const rec = {
+      id: uid("rec"), category: recurringForm.category, amount: Number(recurringForm.amount),
+      dayOfMonth: Math.min(28, Math.max(1, Number(recurringForm.dayOfMonth) || 1)),
+      note: recurringForm.note.trim(), branchId: biz.settings?.activeBranchId || biz.branches?.[0]?.id || null,
+      active: true, lastLoggedMonth: null,
+    };
+    persist({ ...biz, recurringExpenses: [rec, ...recurringExpenses] });
+    setRecurringForm({ category: expenseCategoryOptions[0], amount: "", dayOfMonth: "1", note: "" });
+    setShowRecurringForm(false);
+  };
+  const toggleRecurringActive = (id) => {
+    persist({ ...biz, recurringExpenses: recurringExpenses.map((r) => r.id === id ? { ...r, active: !r.active } : r) });
+  };
+  const removeRecurring = (id) => {
+    persist({ ...biz, recurringExpenses: recurringExpenses.filter((r) => r.id !== id) });
   };
 
   const now = new Date();
@@ -4450,7 +4652,7 @@ function ExpensesPanel({ biz, category: bizCategory, persist, setTab, currentEmp
             <div key={e.id} style={styles.listRow}>
               <div>
                 <div style={styles.listRowTitle}>{e.category}</div>
-                <div style={styles.listRowSub}>{e.note ? `${e.note} · ` : ""}{new Date(e.ts).toLocaleDateString()}{e.payrollRecordId ? " · via Staff & HR" : ""}</div>
+                <div style={styles.listRowSub}>{e.note ? `${e.note} · ` : ""}{new Date(e.ts).toLocaleDateString()}{e.payrollRecordId ? " · via Staff & HR" : ""}{e.recurringId ? " · recurring" : ""}</div>
               </div>
               <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
                 <span style={styles.mono}>−{currency(e.amount)}</span>
@@ -4459,6 +4661,56 @@ function ExpensesPanel({ biz, category: bizCategory, persist, setTab, currentEmp
             </div>
           ))}
         </div>
+      )}
+
+      {!isLocked && (
+        <>
+          <button type="button" style={{ ...styles.textLinkBtn, marginTop: 16 }} onClick={() => setShowRecurring((s) => !s)}>
+            {showRecurring ? "Hide" : "Manage"} recurring expenses ({recurringExpenses.length})
+          </button>
+
+          {showRecurring && (
+            <div style={{ marginTop: 12 }}>
+              <p style={styles.helperText}>Rent, subscriptions, anything that repeats — set it up once and it logs itself automatically on the day you choose each month, the next time the app is opened on or after that date.</p>
+
+              {recurringExpenses.length > 0 && (
+                <div style={styles.list}>
+                  {recurringExpenses.map((r) => (
+                    <div key={r.id} style={{ ...styles.listRow, opacity: r.active ? 1 : 0.55 }}>
+                      <div>
+                        <div style={styles.listRowTitle}>{r.category}</div>
+                        <div style={styles.listRowSub}>{currency(r.amount)}/month · day {r.dayOfMonth}{r.note ? ` · ${r.note}` : ""}{!r.active ? " · paused" : ""}</div>
+                      </div>
+                      <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                        <button style={styles.smallAddBtn} onClick={() => toggleRecurringActive(r.id)}>{r.active ? "Pause" : "Resume"}</button>
+                        <button style={styles.iconBtn} onClick={() => removeRecurring(r.id)}><Trash2 size={15} /></button>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+
+              {!showRecurringForm ? (
+                <button style={{ ...styles.smallAddBtn, marginTop: 10 }} onClick={() => setShowRecurringForm(true)}>+ Add recurring expense</button>
+              ) : (
+                <div style={{ ...styles.formCard, marginTop: 10 }}>
+                  <select style={styles.textInput} value={recurringForm.category} onChange={(e) => setRecurringForm((f) => ({ ...f, category: e.target.value }))}>
+                    {expenseCategoryOptions.map((c) => <option key={c} value={c}>{c}</option>)}
+                  </select>
+                  <div style={styles.formRow}>
+                    <input style={styles.textInputHalf} type="number" placeholder="Amount/month (MWK)" value={recurringForm.amount}
+                      onChange={(e) => setRecurringForm((f) => ({ ...f, amount: e.target.value }))} />
+                    <input style={{ ...styles.textInputHalf, maxWidth: 100 }} type="number" min="1" max="28" placeholder="Day" value={recurringForm.dayOfMonth}
+                      onChange={(e) => setRecurringForm((f) => ({ ...f, dayOfMonth: e.target.value }))} />
+                  </div>
+                  <input style={styles.textInput} placeholder="Note (optional)" value={recurringForm.note}
+                    onChange={(e) => setRecurringForm((f) => ({ ...f, note: e.target.value }))} />
+                  <button style={styles.primaryBtnSmall} onClick={addRecurring}><Check size={16} /> Save recurring expense</button>
+                </div>
+              )}
+            </div>
+          )}
+        </>
       )}
     </div>
   );
@@ -4594,6 +4846,265 @@ function SuppliersPanel({ biz, category, persist, setTab }) {
             })}
           </div>
         </>
+      )}
+    </div>
+  );
+}
+
+/* =========================================================
+   PURCHASE ORDERS
+   The buying-side mirror of Quotes & Estimates: a formal order sent to a supplier
+   before goods arrive, built from the Suppliers list. "Mark received" turns it into
+   real stock + a logged expense in one step — the same effect a manual restock has,
+   just started from an order instead of typed in after the fact.
+   ========================================================= */
+const PO_STATUS_LABELS = { sent: "Sent", received: "Received", cancelled: "Cancelled" };
+function POStatusBadge({ po }) {
+  const map = {
+    sent: { bg: "var(--gold-soft)", fg: "#8A6D00" },
+    received: { bg: "var(--accent-soft)", fg: "var(--accent)" },
+    cancelled: { bg: "rgba(178,58,46,0.12)", fg: "#B23A2E" },
+  };
+  const s = map[po.status] || map.sent;
+  return <span style={{ ...styles.badge, background: s.bg, color: s.fg }}>{PO_STATUS_LABELS[po.status] || po.status}</span>;
+}
+
+function PurchaseOrdersPanel({ biz, category, persist, notify, setTab }) {
+  const [showForm, setShowForm] = useState(false);
+  const [supplierId, setSupplierId] = useState("");
+  const [selectedItemId, setSelectedItemId] = useState("");
+  const [qty, setQty] = useState(1);
+  const [costPerUnit, setCostPerUnit] = useState("");
+  const [customName, setCustomName] = useState("");
+  const [customQty, setCustomQty] = useState(1);
+  const [customCost, setCustomCost] = useState("");
+  const [cart, setCart] = useState([]);
+  const [note, setNote] = useState("");
+  const [viewingPO, setViewingPO] = useState(null);
+
+  const suppliers = biz.suppliers || [];
+  const purchaseOrders = biz.purchaseOrders || [];
+  const branchPOs = filterByBranch(purchaseOrders, biz.settings?.activeBranchId).slice().sort((a, b) => b.ts - a.ts);
+
+  const selectedItem = biz.items.find((i) => i.id === selectedItemId);
+
+  const addToCart = () => {
+    if (!selectedItem || !costPerUnit) return;
+    setCart([...cart, { itemId: selectedItem.id, name: selectedItem.name, qty: Number(qty) || 1, unit: selectedItem.unit || "pcs", costPerUnit: Number(costPerUnit) || 0 }]);
+    setSelectedItemId(""); setQty(1); setCostPerUnit("");
+  };
+  const addCustomLine = () => {
+    if (!customName.trim() || !customCost) return;
+    setCart([...cart, { itemId: null, name: customName.trim(), qty: Number(customQty) || 1, unit: "pcs", costPerUnit: Number(customCost) || 0 }]);
+    setCustomName(""); setCustomQty(1); setCustomCost("");
+  };
+  const removeLine = (idx) => setCart(cart.filter((_, i) => i !== idx));
+
+  const total = cart.reduce((s, c) => s + c.costPerUnit * c.qty, 0);
+
+  const resetForm = () => {
+    setSupplierId(""); setCart([]); setNote(""); setShowForm(false);
+  };
+
+  const submitPO = () => {
+    if (!supplierId || cart.length === 0) return;
+    const supplier = suppliers.find((s) => s.id === supplierId);
+    const po = {
+      id: uid("po"), code: `PO-${Date.now().toString().slice(-6)}`,
+      supplierId, supplierName: supplier?.name || null,
+      items: cart, total, note: note.trim(), status: "sent", ts: Date.now(),
+      branchId: biz.settings?.activeBranchId || biz.branches?.[0]?.id || null,
+    };
+    let next = { ...biz, purchaseOrders: [po, ...purchaseOrders] };
+    next = notify(next, "purchase", `Purchase order ${po.code} created for ${supplier?.name || "a supplier"} — ${currency(total)}`);
+    persist(next);
+    setViewingPO(po);
+    resetForm();
+  };
+
+  const shareLinesFor = (po) => [
+    biz.profile.name, `Purchase Order ${po.code}`, `To: ${po.supplierName || "Supplier"}`, "",
+    ...po.items.map((l) => `${l.qty} ${l.unit !== "pcs" ? l.unit : "×"} ${l.name} @ ${currency(l.costPerUnit)}`), "",
+    `Total: ${currency(po.total)}`, po.note ? `Note: ${po.note}` : "",
+  ].filter(Boolean);
+
+  const cancelPO = (po) => {
+    persist({ ...biz, purchaseOrders: purchaseOrders.map((p) => p.id === po.id ? { ...p, status: "cancelled" } : p) });
+    setViewingPO({ ...po, status: "cancelled" });
+  };
+  const deletePO = (po) => {
+    persist({ ...biz, purchaseOrders: purchaseOrders.filter((p) => p.id !== po.id) });
+    setViewingPO(null);
+  };
+
+  // Turns the order into real stock + a logged expense in one step — the same
+  // effect a manual restock has (see ItemsPanel), just kicked off from a PO.
+  const receivePO = (po) => {
+    let next = { ...biz };
+    let stockLinesCost = 0;
+    next = {
+      ...next,
+      items: next.items.map((it) => {
+        const line = po.items.find((l) => l.itemId === it.id);
+        if (!line) return it;
+        stockLinesCost += line.costPerUnit * line.qty;
+        return { ...it, stock: (it.stock || 0) + line.qty, cost: line.costPerUnit };
+      }),
+    };
+    const restockRecords = po.items.filter((l) => l.itemId).map((l) => ({
+      id: uid("restock"), itemId: l.itemId, itemName: l.name, qty: l.qty, unit: l.unit || "pcs",
+      costPerUnit: l.costPerUnit, totalCost: l.costPerUnit * l.qty,
+      supplier: po.supplierName, supplierId: po.supplierId,
+      sellPriceAtTime: (next.items.find((i) => i.id === l.itemId) || {}).price || 0,
+      ts: Date.now(), branchId: po.branchId, poId: po.id,
+    }));
+    const customLinesCost = po.items.filter((l) => !l.itemId).reduce((s, l) => s + l.costPerUnit * l.qty, 0);
+    const totalCost = stockLinesCost + customLinesCost;
+    next = { ...next, restocks: [...restockRecords, ...(next.restocks || [])] };
+    const exp = {
+      id: uid("exp"), category: "Restocking / buying stock", amount: totalCost,
+      note: `Purchase order ${po.code}${po.supplierName ? " from " + po.supplierName : ""}`,
+      branchId: po.branchId, ts: Date.now(), poId: po.id,
+    };
+    next = { ...next, expenses: [exp, ...next.expenses] };
+    next = { ...next, purchaseOrders: next.purchaseOrders.map((p) => p.id === po.id ? { ...p, status: "received", receivedAt: Date.now() } : p) };
+    next = notify(next, "stock", `Purchase order ${po.code} received — ${currency(totalCost)} added to stock and expenses`);
+    persist(next);
+    setViewingPO({ ...po, status: "received" });
+  };
+
+  return (
+    <div style={styles.panel}>
+      <BackRow onBack={() => setTab("more")} label="More" />
+      <div style={styles.panelHeader}>
+        <SectionTitle title="Purchase Orders" />
+        {suppliers.length > 0 && (
+          <button style={styles.addBtn} onClick={() => (showForm ? resetForm() : setShowForm(true))}>
+            {showForm ? <><X size={16} /> Cancel</> : <><Plus size={16} /> New order</>}
+          </button>
+        )}
+      </div>
+      <p style={styles.helperText}>Send a formal order to a supplier before goods arrive, then mark it received to add the stock and log the cost in one step.</p>
+
+      {suppliers.length === 0 ? (
+        <Callout icon={Truck} tone="warn">
+          Add a supplier first, then come back here to send them an order.
+          <button style={styles.calloutLink} onClick={() => setTab("suppliers")}>Go to Suppliers</button>
+        </Callout>
+      ) : showForm && (
+        <div style={styles.formCard}>
+          <select style={styles.textInput} value={supplierId} onChange={(e) => setSupplierId(e.target.value)}>
+            <option value="">Select supplier…</option>
+            {suppliers.map((s) => <option key={s.id} value={s.id}>{s.name}</option>)}
+          </select>
+
+          <div style={styles.formRow}>
+            <select style={{ ...styles.textInputHalf, minWidth: 0 }} value={selectedItemId} onChange={(e) => { setSelectedItemId(e.target.value); setCostPerUnit(biz.items.find((i) => i.id === e.target.value)?.cost ? String(biz.items.find((i) => i.id === e.target.value).cost) : ""); }}>
+              <option value="">Select {category.itemLabel.toLowerCase()}…</option>
+              {biz.items.map((i) => <option key={i.id} value={i.id}>{i.name}</option>)}
+            </select>
+            <input style={styles.qtyInput} type="number" min="0" step="any" placeholder="Qty" value={qty} onChange={(e) => setQty(e.target.value)} />
+          </div>
+          <div style={styles.formRow}>
+            <input style={styles.textInputHalf} type="number" placeholder="Cost per unit (MWK)" value={costPerUnit} onChange={(e) => setCostPerUnit(e.target.value)} />
+            <button style={styles.smallAddBtn} onClick={addToCart}>Add</button>
+          </div>
+
+          <div style={styles.miniLabel}>Or add a one-off line (e.g. packaging, transport)</div>
+          <div style={styles.formRow}>
+            <input style={styles.textInputHalf} placeholder="Description" value={customName} onChange={(e) => setCustomName(e.target.value)} />
+            <input style={{ ...styles.textInputHalf, maxWidth: 70 }} type="number" placeholder="Qty" value={customQty} onChange={(e) => setCustomQty(e.target.value)} />
+            <input style={{ ...styles.textInputHalf, maxWidth: 110 }} type="number" placeholder="Cost" value={customCost} onChange={(e) => setCustomCost(e.target.value)} />
+            <button style={styles.smallAddBtn} onClick={addCustomLine}>Add</button>
+          </div>
+
+          {cart.length > 0 && (
+            <div style={styles.cartBox}>
+              {cart.map((c, idx) => (
+                <div key={idx} style={styles.cartRow}>
+                  <span>{c.qty} {c.unit !== "pcs" ? c.unit : "×"} {c.name}</span>
+                  <span style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                    <span style={styles.mono}>{currency(c.costPerUnit * c.qty)}</span>
+                    <button type="button" style={{ ...styles.iconBtn, padding: 0 }} onClick={() => removeLine(idx)}><X size={13} /></button>
+                  </span>
+                </div>
+              ))}
+              <div style={styles.cartTotalRow}><span>Total</span><span style={styles.mono}>{currency(total)}</span></div>
+            </div>
+          )}
+
+          <textarea style={styles.textArea} rows={2} placeholder="Note (optional)" value={note} onChange={(e) => setNote(e.target.value)} />
+
+          <button style={{ ...styles.primaryBtnSmall, opacity: (supplierId && cart.length) ? 1 : 0.4 }} disabled={!supplierId || !cart.length} onClick={submitPO}>
+            <Check size={16} /> Save purchase order
+          </button>
+        </div>
+      )}
+
+      {branchPOs.length === 0 ? (
+        <EmptyState text="No purchase orders yet." icon={PackageCheck} />
+      ) : (
+        <div style={styles.list}>
+          {branchPOs.map((po) => (
+            <button key={po.id} className="lift-card" style={styles.listRowClickable} onClick={() => setViewingPO(po)}>
+              <div>
+                <div style={styles.listRowTitle}>{po.code} — {po.supplierName || "Unknown supplier"}</div>
+                <div style={styles.listRowSub}>{po.items.map((l) => l.name).join(", ")} · {new Date(po.ts).toLocaleDateString()}</div>
+              </div>
+              <div style={styles.listRowRight}>
+                <div style={styles.mono}>{currency(po.total)}</div>
+                <POStatusBadge po={po} />
+              </div>
+            </button>
+          ))}
+        </div>
+      )}
+
+      {viewingPO && (
+        <div style={styles.modalOverlay} onClick={() => setViewingPO(null)}>
+          <div style={styles.modalCard} onClick={(e) => e.stopPropagation()}>
+            <div style={styles.invoiceHeader}>
+              <div>
+                <div style={styles.invoiceBrand}>{biz.profile.name}</div>
+                <div style={styles.invoiceMeta}>Purchase Order {viewingPO.code}</div>
+                <div style={styles.invoiceMeta}>To: {viewingPO.supplierName || "Unknown supplier"} · {new Date(viewingPO.ts).toLocaleDateString()}</div>
+              </div>
+              <button style={styles.iconBtn} onClick={() => setViewingPO(null)}><X size={18} /></button>
+            </div>
+            <div style={styles.invoiceItems}>
+              {viewingPO.items.map((l, idx) => (
+                <div key={idx} style={styles.invoiceItemRow}>
+                  <span>{l.qty} {l.unit !== "pcs" ? l.unit : "×"} {l.name}</span>
+                  <span style={styles.mono}>{currency(l.costPerUnit * l.qty)}</span>
+                </div>
+              ))}
+            </div>
+            <div style={styles.invoiceTotalRow}><span>Total</span><span style={styles.mono}>{currency(viewingPO.total)}</span></div>
+            {viewingPO.note && <p style={{ ...styles.helperText, marginTop: 10 }}>{viewingPO.note}</p>}
+            <div style={styles.invoiceStatus}><POStatusBadge po={viewingPO} /></div>
+
+            <div style={{ display: "flex", gap: 8, marginTop: 12 }}>
+              <button style={{ ...styles.printBtn, flex: 1 }} onClick={() => window.print()}><Printer size={15} /> Print</button>
+              <button style={{ ...styles.printBtn, flex: 1, background: "none", border: "1px solid var(--line)", color: "var(--ink)" }}
+                onClick={() => shareText(`Purchase Order ${viewingPO.code}`, shareLinesFor(viewingPO).join("\n"))}>
+                <Share2 size={15} /> Share
+              </button>
+            </div>
+
+            {viewingPO.status === "sent" && (
+              <div style={{ display: "flex", gap: 8, marginTop: 8 }}>
+                <button style={styles.primaryBtnSmall} onClick={() => receivePO(viewingPO)}><PackageCheck size={16} /> Mark received</button>
+                <button style={{ ...styles.printBtn, flex: 1, background: "none", border: "1px solid var(--line)", color: "var(--ink)", marginTop: 0 }} onClick={() => cancelPO(viewingPO)}>Cancel order</button>
+              </div>
+            )}
+            {viewingPO.status === "received" && (
+              <Callout icon={Check} tone="info">Stock and expenses have been updated from this order.</Callout>
+            )}
+            {viewingPO.status !== "received" && (
+              <button style={{ ...styles.logoutBtn, marginTop: 8 }} onClick={() => deletePO(viewingPO)}><Trash2 size={15} /> Delete order</button>
+            )}
+          </div>
+        </div>
       )}
     </div>
   );
@@ -5331,6 +5842,18 @@ function AccountingPanel({ biz, category, persist, setTab }) {
     });
   };
 
+  // Sends a friendly payment reminder through the phone's own share sheet (WhatsApp, SMS,
+  // whatever the person picks) — same mechanism already used for receipts and customer notes.
+  const remindCustomer = (order) => {
+    const lines = [
+      `Hi ${order.customerName || "there"}, this is ${biz.profile.name}.`,
+      `Friendly reminder: you have an outstanding balance of ${currency(order.total)} from ${new Date(order.ts).toLocaleDateString()}.`,
+      `Kindly settle at your earliest convenience — thank you!`,
+    ];
+    shareText(`Payment reminder — ${order.customerName || "Customer"}`, lines.join("\n"));
+    persist({ ...biz, orders: biz.orders.map((o) => o.id === order.id ? { ...o, lastReminderAt: Date.now() } : o) });
+  };
+
   const ledger = [
     ...branchOrdersAll.filter((o) => o.paymentStatus !== "credit").map((o) => ({ id: o.id, ts: o.ts, label: o.customerName || "Walk-in sale", amount: o.total })),
     ...branchExpensesAll.map((e) => ({ id: e.id, ts: e.ts, label: e.category, amount: -e.amount })),
@@ -5406,10 +5929,14 @@ function AccountingPanel({ biz, category, persist, setTab }) {
             <div key={o.id} style={styles.listRow}>
               <div>
                 <div style={styles.listRowTitle}>{o.customerName || "Walk-in"}</div>
-                <div style={styles.listRowSub}>{new Date(o.ts).toLocaleDateString()}</div>
+                <div style={styles.listRowSub}>
+                  {new Date(o.ts).toLocaleDateString()}
+                  {o.lastReminderAt ? ` · Reminded ${new Date(o.lastReminderAt).toLocaleDateString()}` : ""}
+                </div>
               </div>
               <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
                 <span style={styles.mono}>{currency(o.total)}</span>
+                <button style={styles.iconBtn} title="Send payment reminder" onClick={() => remindCustomer(o)}><MessageCircle size={15} /></button>
                 <button style={styles.smallAddBtn} onClick={() => settleOrder(o.id)}>Mark paid</button>
               </div>
             </div>
@@ -5669,6 +6196,338 @@ function BusinessesPanel({ myBusinesses, biz, switchBusiness, switchingBusiness,
           <button style={{ ...styles.logoutBtn, marginTop: 8 }} onClick={() => setShowAddForm(false)}><X size={15} /> Cancel</button>
         </div>
       )}
+    </div>
+  );
+}
+
+/* =========================================================
+   PERSONAL / FAMILY BUDGET (owner only)
+   Entirely separate from the business's own numbers — this is the owner's own
+   money. Supports multiple named budgets (e.g. "Personal", "Family"), each with
+   its own editable categories, a monthly plan, and logged actual spending —
+   plus a simple year-so-far rollup so you can see how a category trends over
+   the year, not just one month.
+   ========================================================= */
+const BUDGET_CATEGORY_PRESETS = ["Food & Groceries", "Rent / Housing", "Transport", "Utilities", "School fees", "Healthcare", "Entertainment", "Savings", "Other"];
+
+function budgetMonthEntries(budget, date) {
+  return (budget.entries || []).filter((e) => {
+    const d = new Date(e.ts);
+    return d.getFullYear() === date.getFullYear() && d.getMonth() === date.getMonth();
+  });
+}
+function budgetTotals(budget, date) {
+  const entries = budgetMonthEntries(budget, date);
+  const spentByCat = {};
+  entries.forEach((e) => { spentByCat[e.categoryId] = (spentByCat[e.categoryId] || 0) + e.amount; });
+  const totalPlanned = (budget.categories || []).reduce((s, c) => s + (c.planned || 0), 0);
+  const totalSpent = entries.reduce((s, e) => s + e.amount, 0);
+  return { spentByCat, totalPlanned, totalSpent };
+}
+
+function BudgetPanel({ biz, persist, notify, setTab }) {
+  const budgets = biz.personalBudgets || [];
+  const [selectedId, setSelectedId] = useState(null);
+  const [showCreate, setShowCreate] = useState(false);
+  const [newName, setNewName] = useState("");
+  const [newCats, setNewCats] = useState([]); // [{ name, planned }] — draft categories before the budget is created
+  const [catNameInput, setCatNameInput] = useState("");
+  const [catPlannedInput, setCatPlannedInput] = useState("");
+
+  const selected = budgets.find((b) => b.id === selectedId);
+
+  const addPresetCat = (name) => {
+    if (newCats.some((c) => c.name.toLowerCase() === name.toLowerCase())) return;
+    setNewCats([...newCats, { name, planned: "" }]);
+  };
+  const addCustomCat = () => {
+    const clean = catNameInput.trim();
+    if (!clean) return;
+    if (newCats.some((c) => c.name.toLowerCase() === clean.toLowerCase())) { setCatNameInput(""); return; }
+    setNewCats([...newCats, { name: clean, planned: catPlannedInput }]);
+    setCatNameInput(""); setCatPlannedInput("");
+  };
+  const removeDraftCat = (name) => setNewCats(newCats.filter((c) => c.name !== name));
+  const setDraftCatPlanned = (name, val) => setNewCats(newCats.map((c) => c.name === name ? { ...c, planned: val } : c));
+
+  const createBudget = () => {
+    if (!newName.trim() || newCats.length === 0) return;
+    const budget = {
+      id: uid("bud"), name: newName.trim(), ts: Date.now(),
+      categories: newCats.map((c) => ({ id: uid("bcat"), name: c.name, planned: Number(c.planned) || 0 })),
+      entries: [],
+    };
+    persist({ ...biz, personalBudgets: [budget, ...budgets] });
+    setNewName(""); setNewCats([]); setShowCreate(false);
+    setSelectedId(budget.id);
+  };
+
+  const removeBudget = (id) => {
+    persist({ ...biz, personalBudgets: budgets.filter((b) => b.id !== id) });
+    if (selectedId === id) setSelectedId(null);
+  };
+
+  if (selected) {
+    return <BudgetDetail biz={biz} persist={persist} notify={notify} budget={selected} onBack={() => setSelectedId(null)} onDelete={() => removeBudget(selected.id)} />;
+  }
+
+  const now = new Date();
+
+  return (
+    <div style={styles.panel}>
+      <SectionTitle title="Budget" />
+      <p style={styles.helperText}>Your own money, kept separate from the business — track personal or family spending against a plan you set. Nothing here affects your business reports.</p>
+
+      <div style={styles.panelHeader}>
+        <SectionTitle title="Your budgets" small />
+        <button style={styles.addBtn} onClick={() => setShowCreate((s) => !s)}>
+          {showCreate ? <><X size={16} /> Cancel</> : <><Plus size={16} /> New budget</>}
+        </button>
+      </div>
+
+      {showCreate && (
+        <div style={styles.formCard}>
+          <input style={styles.textInput} placeholder="Budget name (e.g. Personal, Family)" value={newName} onChange={(e) => setNewName(e.target.value)} />
+          <div style={styles.miniLabel}>Categories</div>
+          <div style={{ display: "flex", flexWrap: "wrap", gap: 8, marginBottom: 12 }}>
+            {BUDGET_CATEGORY_PRESETS.filter((p) => !newCats.some((c) => c.name === p)).map((p) => (
+              <button key={p} type="button" style={{ ...styles.paymentChip, flex: "none" }} onClick={() => addPresetCat(p)}>+ {p}</button>
+            ))}
+          </div>
+          <div style={{ display: "flex", gap: 8, marginBottom: 12 }}>
+            <input style={{ ...styles.textInput, marginBottom: 0 }} placeholder="Custom category…" value={catNameInput}
+              onChange={(e) => setCatNameInput(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); addCustomCat(); } }} />
+            <button type="button" style={styles.smallAddBtn} onClick={addCustomCat}>Add</button>
+          </div>
+
+          {newCats.length > 0 && (
+            <div style={styles.cartBox}>
+              {newCats.map((c) => (
+                <div key={c.name} style={styles.cartRow}>
+                  <span>{c.name}</span>
+                  <span style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                    <input type="number" placeholder="Planned/month" style={{ ...styles.textInputHalf, maxWidth: 110, padding: "6px 8px" }}
+                      value={c.planned} onChange={(e) => setDraftCatPlanned(c.name, e.target.value)} />
+                    <button type="button" style={{ ...styles.iconBtn, padding: 0 }} onClick={() => removeDraftCat(c.name)}><X size={13} /></button>
+                  </span>
+                </div>
+              ))}
+            </div>
+          )}
+
+          <button style={{ ...styles.primaryBtnSmall, opacity: (newName.trim() && newCats.length) ? 1 : 0.4 }}
+            disabled={!newName.trim() || !newCats.length} onClick={createBudget}>
+            <Check size={16} /> Create budget
+          </button>
+        </div>
+      )}
+
+      {budgets.length === 0 ? (
+        <EmptyState text="Create a budget above — personal, family, whatever you like — and start tracking planned vs actual spending." icon={PiggyBank} />
+      ) : (
+        <div style={styles.list}>
+          {budgets.map((b) => {
+            const { totalPlanned, totalSpent } = budgetTotals(b, now);
+            const pct = totalPlanned > 0 ? Math.min(100, Math.round((totalSpent / totalPlanned) * 100)) : 0;
+            const over = totalPlanned > 0 && totalSpent > totalPlanned;
+            return (
+              <button key={b.id} className="lift-card" style={styles.listRowClickable} onClick={() => setSelectedId(b.id)}>
+                <div style={{ flex: 1 }}>
+                  <div style={styles.listRowTitle}>{b.name}</div>
+                  <div style={styles.listRowSub}>{b.categories.length} categor{b.categories.length !== 1 ? "ies" : "y"} · {currency(totalSpent)} of {currency(totalPlanned)} this month</div>
+                  <div style={{ height: 6, background: "var(--bg)", borderRadius: 4, marginTop: 8, overflow: "hidden" }}>
+                    <div style={{ height: "100%", width: `${pct}%`, background: over ? "#B23A2E" : "var(--accent)", borderRadius: 4 }} />
+                  </div>
+                </div>
+                <ChevronRight size={16} color="var(--ink-faint)" />
+              </button>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function BudgetDetail({ biz, persist, notify, budget, onBack, onDelete }) {
+  const budgets = biz.personalBudgets || [];
+  const [monthDate, setMonthDate] = useState(new Date());
+  const [view, setView] = useState("month"); // month | year
+  const [showAddEntry, setShowAddEntry] = useState(false);
+  const [entryForm, setEntryForm] = useState({ categoryId: budget.categories[0]?.id || "", amount: "", note: "", date: toDateInputValue(new Date()) });
+  const [showManageCats, setShowManageCats] = useState(false);
+  const [newCatName, setNewCatName] = useState("");
+  const [newCatPlanned, setNewCatPlanned] = useState("");
+  const today = new Date();
+
+  const updateBudget = (patch) => {
+    persist({ ...biz, personalBudgets: budgets.map((b) => b.id === budget.id ? { ...b, ...patch } : b) });
+  };
+
+  const shiftMonth = (delta) => { const d = new Date(monthDate); d.setMonth(d.getMonth() + delta); setMonthDate(d); };
+  const isCurrentMonth = monthDate.getFullYear() === today.getFullYear() && monthDate.getMonth() === today.getMonth();
+
+  const { spentByCat, totalPlanned, totalSpent } = budgetTotals(budget, monthDate);
+
+  const addEntry = () => {
+    if (!entryForm.categoryId || !entryForm.amount) return;
+    const amount = Number(entryForm.amount) || 0;
+    const entry = { id: uid("bentry"), categoryId: entryForm.categoryId, amount, note: entryForm.note.trim(), ts: new Date(entryForm.date + "T12:00:00").getTime() };
+    const cat = budget.categories.find((c) => c.id === entryForm.categoryId);
+    const entryDate = new Date(entry.ts);
+    const priorSpent = budgetMonthEntries(budget, entryDate).filter((e) => e.categoryId === entryForm.categoryId).reduce((s, e) => s + e.amount, 0);
+    const newSpent = priorSpent + amount;
+    let nextBiz = { ...biz, personalBudgets: budgets.map((b) => b.id === budget.id ? { ...b, entries: [entry, ...(b.entries || [])] } : b) };
+    // Only fires the moment spending first crosses the plan for that category/month —
+    // not on every entry after, so it doesn't spam the Alerts tab.
+    if (notify && cat && cat.planned > 0 && priorSpent <= cat.planned && newSpent > cat.planned) {
+      nextBiz = notify(nextBiz, "budget", `Budget alert — "${cat.name}" in ${budget.name} is now over its planned ${currency(cat.planned)}/month (spent ${currency(newSpent)} this month).`);
+    }
+    persist(nextBiz);
+    setEntryForm({ categoryId: entryForm.categoryId, amount: "", note: "", date: toDateInputValue(new Date()) });
+    setShowAddEntry(false);
+  };
+  const removeEntry = (id) => updateBudget({ entries: (budget.entries || []).filter((e) => e.id !== id) });
+
+  const addCategory = () => {
+    if (!newCatName.trim()) return;
+    const cat = { id: uid("bcat"), name: newCatName.trim(), planned: Number(newCatPlanned) || 0 };
+    updateBudget({ categories: [...budget.categories, cat] });
+    setNewCatName(""); setNewCatPlanned("");
+  };
+  const removeCategory = (id) => {
+    updateBudget({ categories: budget.categories.filter((c) => c.id !== id), entries: (budget.entries || []).filter((e) => e.categoryId !== id) });
+  };
+  const setCategoryPlanned = (id, val) => {
+    updateBudget({ categories: budget.categories.map((c) => c.id === id ? { ...c, planned: Number(val) || 0 } : c) });
+  };
+
+  // Year so far: every entry logged this calendar year, compared against the plan
+  // multiplied by however many months have elapsed (including the current one).
+  const monthsElapsed = today.getMonth() + 1;
+  const yearEntries = (budget.entries || []).filter((e) => new Date(e.ts).getFullYear() === today.getFullYear());
+  const yearSpentByCat = {};
+  yearEntries.forEach((e) => { yearSpentByCat[e.categoryId] = (yearSpentByCat[e.categoryId] || 0) + e.amount; });
+  const yearTotalSpent = yearEntries.reduce((s, e) => s + e.amount, 0);
+  const yearTotalPlanned = totalPlanned * monthsElapsed;
+
+  const monthEntries = budgetMonthEntries(budget, monthDate).sort((a, b) => b.ts - a.ts);
+
+  return (
+    <div style={styles.panel}>
+      <BackRow onBack={onBack} label="Budgets" />
+      <div style={styles.panelHeader}>
+        <SectionTitle title={budget.name} />
+        <button style={styles.addBtn} onClick={() => setShowAddEntry((s) => !s)}>
+          {showAddEntry ? <><X size={16} /> Cancel</> : <><Plus size={16} /> Log spending</>}
+        </button>
+      </div>
+
+      <div style={styles.segmentedRow}>
+        <button style={{ ...styles.segmentBtn, ...(view === "month" ? styles.segmentBtnActive : {}) }} onClick={() => setView("month")}>This month</button>
+        <button style={{ ...styles.segmentBtn, ...(view === "year" ? styles.segmentBtnActive : {}) }} onClick={() => setView("year")}>Year so far</button>
+      </div>
+
+      {view === "month" && (
+        <div style={styles.dateNavRow}>
+          <button style={styles.dateNavArrow} onClick={() => shiftMonth(-1)}>‹</button>
+          <div style={styles.dateNavCenter}>
+            <div style={styles.dateNavLabel}>{isCurrentMonth ? "This month" : monthDate.toLocaleDateString("default", { month: "long", year: "numeric" })}</div>
+          </div>
+          <button style={styles.dateNavArrow} onClick={() => shiftMonth(1)} disabled={isCurrentMonth}>›</button>
+        </div>
+      )}
+
+      {showAddEntry && (
+        <div style={styles.formCard}>
+          <select style={styles.textInput} value={entryForm.categoryId} onChange={(e) => setEntryForm((f) => ({ ...f, categoryId: e.target.value }))}>
+            {budget.categories.map((c) => <option key={c.id} value={c.id}>{c.name}</option>)}
+          </select>
+          <input style={styles.textInput} type="number" placeholder="Amount (MWK)" value={entryForm.amount} onChange={(e) => setEntryForm((f) => ({ ...f, amount: e.target.value }))} />
+          <label style={styles.listRowSub}>Date</label>
+          <input style={{ ...styles.textInput, marginTop: 6 }} type="date" max={toDateInputValue(today)} value={entryForm.date}
+            onChange={(e) => e.target.value && setEntryForm((f) => ({ ...f, date: e.target.value }))} />
+          <input style={styles.textInput} placeholder="Note (optional)" value={entryForm.note} onChange={(e) => setEntryForm((f) => ({ ...f, note: e.target.value }))} />
+          <button style={styles.primaryBtnSmall} onClick={addEntry}><Check size={16} /> Save</button>
+        </div>
+      )}
+
+      <div style={styles.statGrid}>
+        <StatCard label={view === "month" ? "Planned this month" : "Planned so far this year"} value={currency(view === "month" ? totalPlanned : yearTotalPlanned)} />
+        <StatCard label="Actual spent" value={currency(view === "month" ? totalSpent : yearTotalSpent)} />
+      </div>
+
+      <SectionTitle title="By category" small />
+      <div style={styles.list}>
+        {budget.categories.map((c) => {
+          const spent = view === "month" ? (spentByCat[c.id] || 0) : (yearSpentByCat[c.id] || 0);
+          const planned = view === "month" ? c.planned : c.planned * monthsElapsed;
+          const pct = planned > 0 ? Math.min(100, Math.round((spent / planned) * 100)) : (spent > 0 ? 100 : 0);
+          const over = planned > 0 && spent > planned;
+          return (
+            <div key={c.id} style={styles.formCard}>
+              <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 6 }}>
+                <div style={styles.listRowTitle}>{c.name}</div>
+                <div style={{ ...styles.mono, color: over ? "#B23A2E" : "inherit" }}>{currency(spent)} / {currency(planned)}</div>
+              </div>
+              <div style={{ height: 7, background: "var(--bg)", borderRadius: 4, overflow: "hidden" }}>
+                <div style={{ height: "100%", width: `${pct}%`, background: over ? "#B23A2E" : "var(--accent)", borderRadius: 4 }} />
+              </div>
+              {over && <div style={{ fontSize: 11.5, color: "#B23A2E", marginTop: 4, fontWeight: 600 }}>Over by {currency(spent - planned)}</div>}
+            </div>
+          );
+        })}
+      </div>
+
+      {view === "month" && (
+        <>
+          <SectionTitle title="Logged this month" small />
+          {monthEntries.length === 0 ? (
+            <EmptyState text="Nothing logged yet this month." icon={Wallet} />
+          ) : (
+            <div style={styles.list}>
+              {monthEntries.map((e) => {
+                const cat = budget.categories.find((c) => c.id === e.categoryId);
+                return (
+                  <div key={e.id} style={styles.listRow}>
+                    <div>
+                      <div style={styles.listRowTitle}>{cat?.name || "Uncategorized"}</div>
+                      <div style={styles.listRowSub}>{e.note ? `${e.note} · ` : ""}{new Date(e.ts).toLocaleDateString()}</div>
+                    </div>
+                    <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                      <span style={styles.mono}>{currency(e.amount)}</span>
+                      <button style={styles.iconBtn} onClick={() => removeEntry(e.id)}><Trash2 size={15} /></button>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </>
+      )}
+
+      <button type="button" style={styles.textLinkBtn} onClick={() => setShowManageCats((s) => !s)}>
+        {showManageCats ? "Hide" : "Manage"} categories
+      </button>
+      {showManageCats && (
+        <div style={{ ...styles.formCard, marginTop: 10 }}>
+          {budget.categories.map((c) => (
+            <div key={c.id} style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 8 }}>
+              <span style={{ flex: 1, fontSize: 13.5 }}>{c.name}</span>
+              <input type="number" style={{ ...styles.textInputHalf, maxWidth: 110, padding: "8px 10px" }} value={c.planned}
+                onChange={(e) => setCategoryPlanned(c.id, e.target.value)} placeholder="Planned/month" />
+              <button style={styles.iconBtn} onClick={() => removeCategory(c.id)}><Trash2 size={15} /></button>
+            </div>
+          ))}
+          <div style={{ display: "flex", gap: 8, marginTop: 8 }}>
+            <input style={{ ...styles.textInput, marginBottom: 0 }} placeholder="New category…" value={newCatName} onChange={(e) => setNewCatName(e.target.value)} />
+            <input type="number" style={{ ...styles.textInputHalf, maxWidth: 110 }} placeholder="Planned" value={newCatPlanned} onChange={(e) => setNewCatPlanned(e.target.value)} />
+            <button style={styles.smallAddBtn} onClick={addCategory}>Add</button>
+          </div>
+        </div>
+      )}
+
+      <button style={{ ...styles.logoutBtn, marginTop: 16 }} onClick={onDelete}><Trash2 size={15} /> Delete this budget</button>
     </div>
   );
 }
@@ -6383,6 +7242,14 @@ function MorePanel({ isOwner, isManager, currentEmployee, category, setTab }) {
         { id: "activity", label: "Activity", icon: CalendarDays, desc: "Daily, weekly & monthly sales and expenses", show: has("reports") },
         { id: "expenses", label: "Expenses", icon: TrendingDown, desc: "Buying costs, damages/loss, money going out", show: has("reports") },
         { id: "suppliers", label: "Suppliers", icon: Truck, desc: "Contacts and running spend for who you restock from", show: has("reports") },
+        { id: "purchaseOrders", label: "Purchase Orders", icon: PackageCheck, desc: "Send an order to a supplier before goods arrive", show: has("reports") },
+      ],
+    },
+    {
+      title: "Personal",
+      color: "#0E7C7B",
+      rows: [
+        { id: "budget", label: "Budget", icon: PiggyBank, desc: "Your own personal or family budget — kept separate from the business", show: isOwner },
       ],
     },
     {
@@ -6468,7 +7335,7 @@ function BottomNav({ tab, setTab, isOwner, unread, category }) {
     { id: "more", label: "More", icon: MoreHorizontal },
   ];
   const activeSet = {
-    more: ["more", "employees", "branches", "customers", "reports", "accounting", "marketing", "documents", "billing", "settings", "calculator", "expenses", "activity", "integrations", "help", "quotes", "calendar", "suppliers", "businesses"],
+    more: ["more", "employees", "branches", "customers", "reports", "accounting", "marketing", "documents", "billing", "settings", "calculator", "expenses", "activity", "integrations", "help", "quotes", "calendar", "suppliers", "businesses", "budget", "purchaseOrders"],
   };
   return (
     <div style={styles.bottomNav} className="app-bottom-nav">
