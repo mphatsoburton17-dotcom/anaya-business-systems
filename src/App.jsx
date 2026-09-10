@@ -252,6 +252,17 @@ function hasModuleAccess(emp, moduleId) {
   if (emp.role === "custom") return (emp.permissions || []).includes(moduleId);
   return false;
 }
+// Like hasModuleAccess, but for whether a Custom-access employee can actually add/edit/
+// delete within a module, not just view it — a finer-grained layer on top of the
+// existing view permission. Owner/Full/Manager keep their existing full-edit behavior;
+// Custom-access staff need both the module's view permission AND its edit permission.
+function canEditModule(emp, moduleId) {
+  if (!emp) return false;
+  if (emp.role === "owner" || emp.role === "full") return true;
+  if (emp.role === "manager") return ["reports", "accounting", "marketing", "hr"].includes(moduleId);
+  if (emp.role === "custom") return (emp.permissions || []).includes(moduleId) && (emp.editPermissions || []).includes(moduleId);
+  return false;
+}
 
 function uid(prefix) {
   return `${prefix}_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
@@ -766,6 +777,7 @@ function emptyBusiness(name, categoryId, details = {}) {
     personalBudgets: [], // owner-only personal/family budgets — entirely separate from the business's own numbers
     recurringExpenses: [], // templates that auto-log a regular expense (rent, subscriptions) once per month
     purchaseOrders: [], // formal orders sent to a supplier before goods arrive — the buying-side mirror of Quotes
+    calendarNotes: [], // free-text personal reminders pinned to a specific day on the Calendar tab
     settings: { theme: "light", taxRate: 0, discountRate: 0, activeBranchId: null },
   };
 }
@@ -889,6 +901,7 @@ export default function App() {
       personalBudgets: biz_.personalBudgets || [],
       recurringExpenses: biz_.recurringExpenses || [],
       purchaseOrders: biz_.purchaseOrders || [],
+      calendarNotes: biz_.calendarNotes || [],
       expenses: (biz_.expenses || []).map((e) => ({ branchId: defaultBranchId, ...e })),
       orders: (biz_.orders || []).map((o) => ({ branchId: defaultBranchId, ...o })),
       branches,
@@ -928,13 +941,22 @@ export default function App() {
     setSwitchingBusiness(false);
   }, [account, loadActiveBiz]);
 
+  const [recoverySession, setRecoverySession] = useState(null);
+
   useEffect(() => {
     let active = true;
     supabase.auth.getSession().then(async ({ data }) => {
       if (active) await loadFromSession(data.session);
       if (active) setLoading(false);
     });
-    const { data: sub } = supabase.auth.onAuthStateChange((_event, authSession) => {
+    const { data: sub } = supabase.auth.onAuthStateChange((event, authSession) => {
+      // A password-reset link lands here with a temporary "recovery" session — show the
+      // set-new-password screen instead of loading straight into the dashboard with it.
+      if (event === "PASSWORD_RECOVERY") {
+        setRecoverySession(authSession);
+        setLoading(false);
+        return;
+      }
       loadFromSession(authSession);
     });
     return () => { active = false; sub.subscription.unsubscribe(); };
@@ -1103,6 +1125,20 @@ export default function App() {
     );
   }
 
+  if (recoverySession) {
+    return (
+      <ResetPasswordScreen
+        onDone={async () => {
+          const s = recoverySession;
+          setRecoverySession(null);
+          setLoading(true);
+          await loadFromSession(s);
+          setLoading(false);
+        }}
+      />
+    );
+  }
+
   if (!biz || !account) {
     return <AuthGate onRegister={handleRegister} onLogin={handleLogin} onEnter={handleEnter} />;
   }
@@ -1150,7 +1186,7 @@ export default function App() {
           <Overview biz={biz} category={category} isOwner={isStaffView} setTab={setTab} />
         )}
         {tab === "items" && (
-          <ItemsPanel biz={biz} category={category} persist={persist} notify={notify} isOwner={isStaffView} />
+          <ItemsPanel biz={biz} category={category} persist={persist} notify={notify} isOwner={isFullAccess || isManager || canEditModule(currentEmployee, "sales")} />
         )}
         {tab === "orders" && (
           <OrdersPanel biz={biz} category={category} persist={persist} notify={notify} currentEmployee={currentEmployee} />
@@ -1159,7 +1195,7 @@ export default function App() {
           <QuotesPanel biz={biz} category={category} persist={persist} notify={notify} currentEmployee={currentEmployee} isOwner={isStaffView} />
         )}
         {tab === "calendar" && (
-          <CalendarPanel biz={biz} category={category} setTab={setTab} />
+          <CalendarPanel biz={biz} category={category} persist={persist} setTab={setTab} />
         )}
         {tab === "customers" && (
           <CustomersPanel biz={biz} category={category} persist={persist} isOwner={isStaffView} setTab={setTab} />
@@ -1180,7 +1216,7 @@ export default function App() {
           <ReportsPanel biz={biz} category={category} setTab={setTab} />
         )}
         {tab === "expenses" && (isOwner || isManager || hasModuleAccess(currentEmployee, "reports")) && (
-          <ExpensesPanel biz={biz} category={category} persist={persist} setTab={setTab} currentEmployee={currentEmployee} />
+          <ExpensesPanel biz={biz} category={category} persist={persist} setTab={setTab} currentEmployee={currentEmployee} canEdit={isOwner || isManager || canEditModule(currentEmployee, "reports")} />
         )}
         {tab === "activity" && (isOwner || isManager || hasModuleAccess(currentEmployee, "reports")) && (
           <ActivityPanel biz={biz} category={category} setTab={setTab} />
@@ -1606,6 +1642,65 @@ function LandingPage({ onGetStarted, onLogin }) {
   );
 }
 
+/* =========================================================
+   RESET PASSWORD (shown after tapping a password-reset email link)
+   ========================================================= */
+function ResetPasswordScreen({ onDone }) {
+  const [password, setPassword] = useState("");
+  const [confirm, setConfirm] = useState("");
+  const [error, setError] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [done, setDone] = useState(false);
+
+  const submit = async () => {
+    if (password.length < 6) { setError("Password must be at least 6 characters."); return; }
+    if (password !== confirm) { setError("Passwords don't match."); return; }
+    setBusy(true); setError("");
+    const { error: err } = await supabase.auth.updateUser({ password });
+    setBusy(false);
+    if (err) { setError(err.message); return; }
+    setDone(true);
+  };
+
+  return (
+    <div style={{ ...styles.onboardShell, "--accent": BRAND.accent, "--accent-soft": BRAND.accentSoft, "--ink": BRAND.ink, "--ink-soft": BRAND.inkSoft, "--ink-faint": BRAND.inkFaint, "--surface": BRAND.surface, "--bg": BRAND.bg, "--line": BRAND.line }}>
+      <style>{fontImports}</style>
+      <div style={styles.onboardMark}>Anaya</div>
+      <div style={styles.onboardSub}>Business Systems</div>
+      <div style={styles.onboardCard}>
+        {done ? (
+          <>
+            <h1 style={styles.h1}>Password updated</h1>
+            <p style={styles.helperText}>You can continue into your dashboard now.</p>
+            <button className="primary-btn-smart" style={styles.primaryBtn} onClick={onDone}>
+              Continue <ChevronRight size={18} />
+            </button>
+          </>
+        ) : (
+          <>
+            <h1 style={styles.h1}>Set a new password</h1>
+            <p style={styles.helperText}>Choose a new password for your account.</p>
+            <div style={styles.authFieldWrap}>
+              <Lock size={16} color="var(--ink-faint)" />
+              <input style={styles.authField} type="password" placeholder="New password" value={password}
+                onChange={(e) => setPassword(e.target.value)} />
+            </div>
+            <div style={styles.authFieldWrap}>
+              <Lock size={16} color="var(--ink-faint)" />
+              <input style={styles.authField} type="password" placeholder="Confirm new password" value={confirm}
+                onChange={(e) => setConfirm(e.target.value)} onKeyDown={(e) => e.key === "Enter" && !busy && submit()} />
+            </div>
+            {error && <div style={styles.authError}>{error}</div>}
+            <button className="primary-btn-smart" style={{ ...styles.primaryBtn, opacity: busy ? 0.6 : 1 }} disabled={busy} onClick={submit}>
+              {busy ? "Saving…" : "Save new password"} <ChevronRight size={18} />
+            </button>
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
 function AuthGate({ onRegister, onLogin, onEnter }) {
   const [screen, setScreen] = useState("landing"); // landing | login | register-creds | register-onboard
   const [email, setEmail] = useState("");
@@ -1615,12 +1710,27 @@ function AuthGate({ onRegister, onLogin, onEnter }) {
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
   const [pendingRegistration, setPendingRegistration] = useState(null); // { businessId, business, email }
+  const [forgotEmail, setForgotEmail] = useState("");
+  const [forgotSent, setForgotSent] = useState(false);
+  const [forgotBusy, setForgotBusy] = useState(false);
 
   const normalizedEmail = email.trim().toLowerCase();
 
   const goRegisterCreds = () => { setError(""); setScreen("register-creds"); };
   const goLogin = () => { setError(""); setScreen("login"); };
   const goLanding = () => { setError(""); setScreen("landing"); };
+  const goForgot = () => { setError(""); setForgotSent(false); setForgotEmail(identifier.includes("@") ? identifier : ""); setScreen("forgot"); };
+
+  const submitForgot = async () => {
+    if (!forgotEmail.trim() || !forgotEmail.includes("@")) { setError("Enter a valid email address."); return; }
+    setForgotBusy(true); setError("");
+    const { error: err } = await supabase.auth.resetPasswordForEmail(forgotEmail.trim(), {
+      redirectTo: window.location.origin + window.location.pathname,
+    });
+    setForgotBusy(false);
+    if (err) { setError(err.message); return; }
+    setForgotSent(true);
+  };
 
   const submitLogin = async () => {
     if (!identifier.trim() || !password) { setError("Enter your email and password."); return; }
@@ -1693,10 +1803,35 @@ function AuthGate({ onRegister, onLogin, onEnter }) {
             <input style={styles.authField} type="password" placeholder="Password" value={password}
               onChange={(e) => setPassword(e.target.value)} onKeyDown={(e) => e.key === "Enter" && !busy && submitLogin()} />
           </div>
+          <button type="button" style={{ ...styles.textLinkBtn, marginTop: -6, marginBottom: 12 }} onClick={goForgot}>Forgot password?</button>
           {error && <div style={styles.authError}>{error}</div>}
           <button className="primary-btn-smart" style={{ ...styles.primaryBtn, opacity: busy ? 0.6 : 1 }} disabled={busy} onClick={submitLogin}>
             {busy ? "Logging in…" : "Log in"} <ChevronRight size={18} />
           </button>
+        </div>
+      )}
+
+      {screen === "forgot" && (
+        <div style={styles.onboardCard}>
+          <button style={styles.backTextBtn} onClick={goLogin}>Back</button>
+          <h1 style={styles.h1}>Reset your password</h1>
+          {forgotSent ? (
+            <p style={styles.helperText}>Check your email for a link to reset your password. It can take a minute or two to arrive.</p>
+          ) : (
+            <>
+              <p style={styles.helperText}>Enter the email on your account and we'll send you a reset link.</p>
+              <div style={styles.authFieldWrap}>
+                <Mail size={16} color="var(--ink-faint)" />
+                <input style={styles.authField} placeholder="Email" value={forgotEmail}
+                  onChange={(e) => setForgotEmail(e.target.value)} autoCapitalize="none"
+                  onKeyDown={(e) => e.key === "Enter" && !forgotBusy && submitForgot()} />
+              </div>
+              {error && <div style={styles.authError}>{error}</div>}
+              <button className="primary-btn-smart" style={{ ...styles.primaryBtn, opacity: forgotBusy ? 0.6 : 1 }} disabled={forgotBusy} onClick={submitForgot}>
+                {forgotBusy ? "Sending…" : "Send reset link"} <ChevronRight size={18} />
+              </button>
+            </>
+          )}
         </div>
       )}
 
@@ -4135,7 +4270,7 @@ function EmployeesPanel({ biz, category, persist, setTab, currentEmployee }) {
   const isViewerOwner = currentEmployee?.role === "owner" || currentEmployee?.role === "full";
   const isViewerManager = currentEmployee?.role === "manager";
   const blankForm = {
-    name: "", position: "", role: "sales", permissions: [], hourlyRate: "", branchId: "",
+    name: "", position: "", role: "sales", permissions: [], editPermissions: [], hourlyRate: "", branchId: "",
     phone: "", email: "", age: "", address: "", idNumber: "", startDate: "", emergencyName: "", emergencyPhone: "",
     status: "fulltime", salary: "", bankAccount: "", target: "", performanceNotes: "",
   };
@@ -4169,7 +4304,7 @@ function EmployeesPanel({ biz, category, persist, setTab, currentEmployee }) {
 
   const startEdit = (emp) => {
     setForm({
-      name: emp.name, position: emp.position || "", role: emp.role, permissions: emp.permissions || [], hourlyRate: String(emp.hourlyRate || ""), branchId: emp.branchId || "",
+      name: emp.name, position: emp.position || "", role: emp.role, permissions: emp.permissions || [], editPermissions: emp.editPermissions || [], hourlyRate: String(emp.hourlyRate || ""), branchId: emp.branchId || "",
       phone: emp.phone || "", email: emp.email || "", age: emp.age || "", address: emp.address || "", idNumber: emp.idNumber || "",
       startDate: emp.startDate || "", emergencyName: emp.emergencyName || "", emergencyPhone: emp.emergencyPhone || "",
       status: emp.status || "fulltime", salary: String(emp.salary || ""), bankAccount: emp.bankAccount || "",
@@ -4184,6 +4319,15 @@ function EmployeesPanel({ biz, category, persist, setTab, currentEmployee }) {
     setForm((f) => ({
       ...f,
       permissions: f.permissions.includes(moduleId) ? f.permissions.filter((p) => p !== moduleId) : [...f.permissions, moduleId],
+      // Revoking view access for a module also revokes edit access to it — edit never
+      // makes sense without view.
+      editPermissions: f.permissions.includes(moduleId) ? f.editPermissions.filter((p) => p !== moduleId) : f.editPermissions,
+    }));
+  };
+  const toggleEditPermission = (moduleId) => {
+    setForm((f) => ({
+      ...f,
+      editPermissions: f.editPermissions.includes(moduleId) ? f.editPermissions.filter((p) => p !== moduleId) : [...f.editPermissions, moduleId],
     }));
   };
 
@@ -4196,6 +4340,7 @@ function EmployeesPanel({ biz, category, persist, setTab, currentEmployee }) {
     const sharedFields = {
       name: form.name.trim(), position: form.position.trim(), role, branchId,
       permissions: role === "custom" ? form.permissions : [],
+      editPermissions: role === "custom" ? form.editPermissions : [],
       hourlyRate: Number(form.hourlyRate) || 0,
       phone: form.phone.trim(), email: form.email.trim(), age: form.age, address: form.address.trim(),
       idNumber: form.idNumber.trim(),
@@ -4398,15 +4543,27 @@ function EmployeesPanel({ biz, category, persist, setTab, currentEmployee }) {
 
               {form.role === "custom" && (
                 <div style={styles.permissionGrid}>
-                  {ACCESS_MODULES.map((m) => (
-                    <label key={m.id} style={styles.permissionRow}>
-                      <input type="checkbox" checked={form.permissions.includes(m.id)} onChange={() => togglePermission(m.id)} />
-                      <div>
-                        <div style={styles.listRowTitle}>{m.label}</div>
-                        <div style={styles.listRowSub}>{m.desc}</div>
+                  <p style={{ ...styles.helperText, marginBottom: 4, marginTop: 0 }}>Tick a module to let them see it. Tick "Can edit/delete" as well if they should also be able to add, change, or remove things there — otherwise it's view-only.</p>
+                  {ACCESS_MODULES.map((m) => {
+                    const canView = form.permissions.includes(m.id);
+                    return (
+                      <div key={m.id} style={styles.permissionRow}>
+                        <label style={{ display: "flex", alignItems: "flex-start", gap: 8, flex: 1, cursor: "pointer" }}>
+                          <input type="checkbox" checked={canView} onChange={() => togglePermission(m.id)} />
+                          <div>
+                            <div style={styles.listRowTitle}>{m.label}</div>
+                            <div style={styles.listRowSub}>{m.desc}</div>
+                          </div>
+                        </label>
+                        {canView && (
+                          <label style={{ display: "flex", alignItems: "center", gap: 6, marginTop: 6, marginLeft: 24, cursor: "pointer" }}>
+                            <input type="checkbox" checked={form.editPermissions.includes(m.id)} onChange={() => toggleEditPermission(m.id)} />
+                            <span style={{ fontSize: 12.5, color: "var(--ink-soft)" }}>Can edit/delete (not just view)</span>
+                          </label>
+                        )}
                       </div>
-                    </label>
-                  ))}
+                    );
+                  })}
                 </div>
               )}
             </>
@@ -4735,7 +4892,7 @@ function BranchesPanel({ biz, category, persist, setTab, currentEmployee }) {
 /* =========================================================
    EXPENSES (owner only)
    ========================================================= */
-function ExpensesPanel({ biz, category: bizCategory, persist, setTab, currentEmployee }) {
+function ExpensesPanel({ biz, category: bizCategory, persist, setTab, currentEmployee, canEdit = true }) {
   const expenseCategoryOptions = expenseCategoriesFor(bizCategory?.id);
   const [showForm, setShowForm] = useState(false);
   const [category, setCategory] = useState(expenseCategoryOptions[0]);
@@ -4755,7 +4912,7 @@ function ExpensesPanel({ biz, category: bizCategory, persist, setTab, currentEmp
   const lockedByName = isLocked ? biz.employees.find((e) => e.id === activeBranch.assignedEmployeeId)?.name : null;
 
   const addExpense = () => {
-    if (isLocked) return;
+    if (isLocked || !canEdit) return;
     if (!amount || Number(amount) <= 0) return;
     const ts = new Date((expenseDate || toDateInputValue(new Date())) + "T12:00:00").getTime();
     const exp = { id: uid("exp"), category, amount: Number(amount), note: note.trim(), branchId: biz.settings?.activeBranchId || biz.branches?.[0]?.id || null, ts };
@@ -4764,14 +4921,14 @@ function ExpensesPanel({ biz, category: bizCategory, persist, setTab, currentEmp
   };
 
   const removeExpense = (id) => {
-    if (isLocked) return;
+    if (isLocked || !canEdit) return;
     persist({ ...biz, expenses: biz.expenses.filter((e) => e.id !== id) });
   };
 
   // Recurring expense templates — auto-logged once per month by the effect in the main
   // App component (see recurringCheckedRef there). This panel just creates/edits/removes them.
   const addRecurring = () => {
-    if (isLocked) return;
+    if (isLocked || !canEdit) return;
     if (!recurringForm.amount || Number(recurringForm.amount) <= 0) return;
     const rec = {
       id: uid("rec"), category: recurringForm.category, amount: Number(recurringForm.amount),
@@ -4803,7 +4960,7 @@ function ExpensesPanel({ biz, category: bizCategory, persist, setTab, currentEmp
       <BackRow onBack={() => setTab("more")} label="More" />
       <div style={styles.panelHeader}>
         <SectionTitle title="Expenses" />
-        {!isLocked && (
+        {!isLocked && canEdit && (
           <button style={styles.addBtn} onClick={() => setShowForm((s) => !s)}>
             <Plus size={16} /> Add
           </button>
@@ -4816,12 +4973,18 @@ function ExpensesPanel({ biz, category: bizCategory, persist, setTab, currentEmp
         </div>
       )}
 
+      {!isLocked && !canEdit && (
+        <div style={styles.helperBanner}>
+          You have view-only access to expenses — ask the owner for edit access if you need to add or remove entries.
+        </div>
+      )}
+
       <div style={styles.statGrid}>
         <StatCard label="Spent this month" value={currency(totalThisMonth)} />
         {bizCategory?.id !== "property" && <StatCard label="Damages / loss" value={currency(damagesThisMonth)} />}
       </div>
 
-      {showForm && !isLocked && (
+      {showForm && !isLocked && canEdit && (
         <div style={styles.formCard}>
           <select style={styles.textInput} value={category} onChange={(e) => setCategory(e.target.value)}>
             {expenseCategoryOptions.map((c) => <option key={c} value={c}>{c}</option>)}
@@ -4850,14 +5013,14 @@ function ExpensesPanel({ biz, category: bizCategory, persist, setTab, currentEmp
               </div>
               <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
                 <span style={styles.mono}>−{currency(e.amount)}</span>
-                {!e.payrollRecordId && !isLocked && <button style={styles.iconBtn} onClick={() => removeExpense(e.id)}><Trash2 size={15} /></button>}
+                {!e.payrollRecordId && !isLocked && canEdit && <button style={styles.iconBtn} onClick={() => removeExpense(e.id)}><Trash2 size={15} /></button>}
               </div>
             </div>
           ))}
         </div>
       )}
 
-      {!isLocked && (
+      {!isLocked && canEdit && (
         <>
           <button type="button" style={{ ...styles.textLinkBtn, marginTop: 16 }} onClick={() => setShowRecurring((s) => !s)}>
             {showRecurring ? "Hide" : "Manage"} recurring expenses ({recurringExpenses.length})
@@ -5555,15 +5718,17 @@ function buildMonthGrid(monthDate) {
   return cells;
 }
 
-function CalendarPanel({ biz, category, setTab }) {
+function CalendarPanel({ biz, category, persist, setTab }) {
   const [monthDate, setMonthDate] = useState(new Date());
   const [selectedDate, setSelectedDate] = useState(new Date());
+  const [newNoteText, setNewNoteText] = useState("");
   const today = new Date();
   const isPropertyBiz = category.id === "property";
   const isServiceBiz = category.id === "service";
 
   const branchOrders = filterByBranch(biz.orders, biz.settings?.activeBranchId);
   const properties = itemsForBranch(biz.items, biz.settings?.activeBranchId).filter((i) => i.meta);
+  const calendarNotes = biz.calendarNotes || [];
 
   const shiftMonth = (delta) => { const d = new Date(monthDate); d.setMonth(d.getMonth() + delta); setMonthDate(d); };
   const isCurrentMonth = monthDate.getFullYear() === today.getFullYear() && monthDate.getMonth() === today.getMonth();
@@ -5582,10 +5747,22 @@ function CalendarPanel({ biz, category, setTab }) {
   };
 
   const ordersOn = (date) => branchOrders.filter((o) => isSameDay(o.ts, date));
+  const notesOn = (date) => calendarNotes.filter((n) => n.date === toDateInputValue(date));
 
   const cells = buildMonthGrid(monthDate);
   const selectedProperties = propertiesDueOn(selectedDate);
   const selectedOrders = ordersOn(selectedDate);
+  const selectedNotes = notesOn(selectedDate).sort((a, b) => b.ts - a.ts);
+
+  const addNote = () => {
+    if (!newNoteText.trim()) return;
+    const note = { id: uid("cnote"), date: toDateInputValue(selectedDate), text: newNoteText.trim(), ts: Date.now() };
+    persist({ ...biz, calendarNotes: [note, ...calendarNotes] });
+    setNewNoteText("");
+  };
+  const removeNote = (id) => {
+    persist({ ...biz, calendarNotes: calendarNotes.filter((n) => n.id !== id) });
+  };
 
   const cs = {
     weekHeader: { display: "grid", gridTemplateColumns: "repeat(7, 1fr)", gap: 4, marginBottom: 6 },
@@ -5597,6 +5774,7 @@ function CalendarPanel({ biz, category, setTab }) {
     cellSelected: { background: "var(--accent-soft)", borderColor: "var(--accent)" },
     cellNum: { fontSize: 12.5, fontWeight: 600, color: "var(--ink)" },
     cellDot: { width: 5, height: 5, borderRadius: "50%", marginTop: 2 },
+    cellDotRow: { display: "flex", gap: 3, marginTop: 2 },
   };
 
   const dotColorForDay = (date) => {
@@ -5635,11 +5813,15 @@ function CalendarPanel({ biz, category, setTab }) {
           const isToday = isSameDay(today.getTime(), date);
           const isSelected = isSameDay(selectedDate.getTime(), date);
           const dot = dotColorForDay(date);
+          const hasNote = notesOn(date).length > 0;
           return (
             <button key={i} style={{ ...cs.cell, ...(isToday ? cs.cellToday : {}), ...(isSelected ? cs.cellSelected : {}) }}
               onClick={() => setSelectedDate(date)}>
               <span style={cs.cellNum}>{date.getDate()}</span>
-              {dot && <span style={{ ...cs.cellDot, background: dot }} />}
+              <div style={cs.cellDotRow}>
+                {dot && <span style={{ ...cs.cellDot, background: dot }} />}
+                {hasNote && <span style={{ ...cs.cellDot, background: "#B8862F" }} />}
+              </div>
             </button>
           );
         })}
@@ -5688,6 +5870,25 @@ function CalendarPanel({ biz, category, setTab }) {
           To schedule a future {category.orderNoun.toLowerCase()}, create it from the {category.orderNounPlural} tab and set its date ahead — it'll appear here on that day.
         </p>
       )}
+
+      <SectionTitle title="Your notes" small />
+      <p style={styles.helperText}>Write yourself a reminder for this day — a planned sale, a restock, anything.</p>
+      {selectedNotes.length > 0 && (
+        <div style={styles.list}>
+          {selectedNotes.map((n) => (
+            <div key={n.id} style={styles.listRow}>
+              <div style={{ flex: 1 }}><div style={styles.listRowTitle}>{n.text}</div></div>
+              <button style={styles.iconBtn} onClick={() => removeNote(n.id)}><Trash2 size={15} /></button>
+            </div>
+          ))}
+        </div>
+      )}
+      <div style={{ ...styles.formRow, marginTop: selectedNotes.length ? 10 : 0 }}>
+        <input style={{ ...styles.textInput, flex: 1, marginBottom: 0 }} placeholder="Add a note for this day…"
+          value={newNoteText} onChange={(e) => setNewNoteText(e.target.value)}
+          onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); addNote(); } }} />
+        <button style={styles.smallAddBtn} onClick={addNote}>Add</button>
+      </div>
     </div>
   );
 }
@@ -7129,6 +7330,32 @@ function DocumentsPanel({ biz, category, persist, setTab, canEditBranding = true
     setExtra(result.data.text || "");
   };
 
+  // "Describe what you need" mode — skips templates entirely. AI writes the full letter
+  // (greeting through sign-off) from one prompt; you only add logo/signature after, via
+  // the branding section above, same as any other document.
+  const [mode, setMode] = useState("template"); // template | prompt
+  const [fullPrompt, setFullPrompt] = useState("");
+  const [fullDraftText, setFullDraftText] = useState("");
+  const [fullDrafting, setFullDrafting] = useState(false);
+  const [fullDraftError, setFullDraftError] = useState("");
+
+  const draftFullLetter = async () => {
+    if (!fullPrompt.trim()) return;
+    setFullDrafting(true); setFullDraftError(""); setFullDraftText("");
+    const result = await callAiAssist("full_letter", fullPrompt.trim());
+    setFullDrafting(false);
+    if (!result.ok) { setFullDraftError(result.error); return; }
+    setFullDraftText(result.data.text || "");
+  };
+
+  const generateFromPrompt = () => {
+    if (!fullDraftText.trim()) return;
+    const doc = { id: uid("doc"), templateId: "custom", templateLabel: "AI-generated letter", personName: "—", text: fullDraftText.trim(), ts: Date.now() };
+    persist({ ...biz, documents: [doc, ...biz.documents] });
+    setPreview(doc);
+    setFullPrompt(""); setFullDraftText("");
+  };
+
   const generate = () => {
     const person = people.find((p) => p.id === personId);
     const property = isLeaseTemplate ? biz.items.find((i) => i.id === propertyId) : null;
@@ -7251,36 +7478,65 @@ function DocumentsPanel({ biz, category, persist, setTab, canEditBranding = true
           </div>
         )}
 
-        <select style={styles.textInput} value={templateId} onChange={(e) => { setTemplateId(e.target.value); setPersonId(""); }}>
-          {LETTER_TEMPLATES.map((t) => <option key={t.id} value={t.id}>{t.label}</option>)}
-        </select>
-        <select style={styles.textInput} value={personId} onChange={(e) => setPersonId(e.target.value)}>
-          <option value="">Select {template.forWhom === "employee" ? "employee" : category.customerNoun.toLowerCase()}…</option>
-          {people.map((p) => <option key={p.id} value={p.id}>{p.name}</option>)}
-        </select>
-        {isLeaseTemplate && (
-          <select style={styles.textInput} value={propertyId} onChange={(e) => setPropertyId(e.target.value)}>
-            <option value="">Select property…</option>
-            {itemsForBranch(biz.items, biz.settings?.activeBranchId).map((i) => (
-              <option key={i.id} value={i.id}>{i.name} — {currency(i.price)}/month</option>
-            ))}
-          </select>
-        )}
-
-        <div style={styles.miniLabel}>Ask AI to draft this section (optional)</div>
-        <div style={styles.formRow}>
-          <input style={{ ...styles.textInput, flex: 1, marginBottom: 0 }} placeholder="Describe the situation…" value={aiDraftInput} onChange={(e) => setAiDraftInput(e.target.value)} />
-          <button style={styles.smallAddBtn} disabled={!aiDraftInput.trim() || aiDrafting} onClick={draftWithAI}>
-            {aiDrafting ? "…" : "Draft"}
-          </button>
+        <div style={styles.segmentedRow}>
+          <button style={{ ...styles.segmentBtn, ...(mode === "template" ? styles.segmentBtnActive : {}) }} onClick={() => setMode("template")}>Use a template</button>
+          <button style={{ ...styles.segmentBtn, ...(mode === "prompt" ? styles.segmentBtnActive : {}) }} onClick={() => setMode("prompt")}>Describe what you need</button>
         </div>
-        {aiDraftError && <div style={styles.authError}>{aiDraftError}</div>}
 
-        <textarea style={styles.textArea} placeholder={isLeaseTemplate ? "Add specific lease terms (optional) — deposit amount, lease length, house rules…" : "Add specific details (optional) — reason, dates, performance notes…"}
-          value={extra} onChange={(e) => setExtra(e.target.value)} rows={3} />
-        <button style={styles.primaryBtnSmall} onClick={generate}>
-          <FileText size={16} /> Generate letter
-        </button>
+        {mode === "template" ? (
+          <>
+            <select style={styles.textInput} value={templateId} onChange={(e) => { setTemplateId(e.target.value); setPersonId(""); }}>
+              {LETTER_TEMPLATES.map((t) => <option key={t.id} value={t.id}>{t.label}</option>)}
+            </select>
+            <select style={styles.textInput} value={personId} onChange={(e) => setPersonId(e.target.value)}>
+              <option value="">Select {template.forWhom === "employee" ? "employee" : category.customerNoun.toLowerCase()}…</option>
+              {people.map((p) => <option key={p.id} value={p.id}>{p.name}</option>)}
+            </select>
+            {isLeaseTemplate && (
+              <select style={styles.textInput} value={propertyId} onChange={(e) => setPropertyId(e.target.value)}>
+                <option value="">Select property…</option>
+                {itemsForBranch(biz.items, biz.settings?.activeBranchId).map((i) => (
+                  <option key={i.id} value={i.id}>{i.name} — {currency(i.price)}/month</option>
+                ))}
+              </select>
+            )}
+
+            <div style={styles.miniLabel}>Ask AI to draft this section (optional)</div>
+            <div style={styles.formRow}>
+              <input style={{ ...styles.textInput, flex: 1, marginBottom: 0 }} placeholder="Describe the situation…" value={aiDraftInput} onChange={(e) => setAiDraftInput(e.target.value)} />
+              <button style={styles.smallAddBtn} disabled={!aiDraftInput.trim() || aiDrafting} onClick={draftWithAI}>
+                {aiDrafting ? "…" : "Draft"}
+              </button>
+            </div>
+            {aiDraftError && <div style={styles.authError}>{aiDraftError}</div>}
+
+            <textarea style={styles.textArea} placeholder={isLeaseTemplate ? "Add specific lease terms (optional) — deposit amount, lease length, house rules…" : "Add specific details (optional) — reason, dates, performance notes…"}
+              value={extra} onChange={(e) => setExtra(e.target.value)} rows={3} />
+            <button style={styles.primaryBtnSmall} onClick={generate}>
+              <FileText size={16} /> Generate letter
+            </button>
+          </>
+        ) : (
+          <>
+            <p style={styles.helperText}>Write a short prompt describing what you need — who it's for, what it's about, any key details. AI writes the full letter; you just add your logo and signature above.</p>
+            <textarea style={styles.textArea} rows={4} placeholder='e.g. "A recommendation letter for Grace, who worked as our cashier for 2 years, always punctual and great with customers"'
+              value={fullPrompt} onChange={(e) => setFullPrompt(e.target.value)} />
+            <button style={{ ...styles.primaryBtnSmall, opacity: fullPrompt.trim() ? 1 : 0.5 }} disabled={!fullPrompt.trim() || fullDrafting} onClick={draftFullLetter}>
+              <Sparkles size={16} /> {fullDrafting ? "Writing…" : "Generate with AI"}
+            </button>
+            {fullDraftError && <div style={styles.authError}>{fullDraftError}</div>}
+
+            {fullDraftText && (
+              <>
+                <div style={{ ...styles.miniLabel, marginTop: 14 }}>Review and edit before saving</div>
+                <textarea style={{ ...styles.textArea, minHeight: 160 }} value={fullDraftText} onChange={(e) => setFullDraftText(e.target.value)} rows={8} />
+                <button style={styles.primaryBtnSmall} onClick={generateFromPrompt}>
+                  <Check size={16} /> Use this letter
+                </button>
+              </>
+            )}
+          </>
+        )}
       </div>
 
       {biz.documents.length > 0 && (
