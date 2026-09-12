@@ -2666,6 +2666,25 @@ function Overview({ biz, category, isOwner, setTab }) {
   );
   const overdueProperties = occupiedProperties.filter((p) => !paidPropertyIdsThisMonth.has(p.id));
 
+  // Growth trend — revenue for the current period vs. the one right before it, plus a short
+  // line chart across the last 6 periods at whatever granularity is currently selected
+  // (day-over-day, week-over-week, or month-over-month). "All time" falls back to monthly.
+  const growthKind = statsPeriod === "all" ? "month" : statsPeriod;
+  const growthPoints = Array.from({ length: 6 }, (_, i) => {
+    const offset = 5 - i;
+    const [start, end] = periodBoundsFor(growthKind, offset);
+    const value = periodSummary(biz, start, end).revenue;
+    const label = growthKind === "today"
+      ? start.toLocaleDateString("default", { weekday: "narrow" })
+      : growthKind === "week"
+      ? `W${6 - i}`
+      : start.toLocaleDateString("default", { month: "short" });
+    return { label, value };
+  });
+  const growthPct = percentChange(growthPoints[5].value, growthPoints[4].value);
+  const hasGrowthData = growthPoints.some((p) => p.value > 0);
+  const growthKindLabel = growthKind === "today" ? "day over day" : growthKind === "week" ? "week over week" : "month over month";
+
   return (
     <div style={styles.panel}>
       <SectionTitle title="Overview" />
@@ -2703,6 +2722,26 @@ function Overview({ biz, category, isOwner, setTab }) {
           ? <StatCard label="Average sale" value={currency(avgSale)} icon={Wallet} tint="linear-gradient(135deg, #E0A63A 0%, #A6690F 100%)" />
           : <StatCard label={category.customerNounPlural} value={biz.customers.length} icon={Users} tint="linear-gradient(135deg, #E0A63A 0%, #A6690F 100%)" />}
       </div>
+
+      {isOwner && hasGrowthData && (
+        <div className="lift-card" style={styles.trendCard}>
+          <div style={styles.trendHeaderRow}>
+            <div style={styles.trendHeader}>Growth — {growthKindLabel}</div>
+            <span style={{
+              fontSize: 13, fontWeight: 700, display: "flex", alignItems: "center", gap: 4,
+              color: growthPct === null ? "var(--accent)" : growthPct >= 0 ? "#22A06B" : "#B23A2E",
+            }}>
+              {growthPct === null ? "New" : (
+                <>
+                  {growthPct >= 0 ? <TrendingUp size={14} /> : <TrendingDown size={14} />}
+                  {Math.abs(Math.round(growthPct))}%
+                </>
+              )}
+            </span>
+          </div>
+          <GrowthLineChart points={growthPoints} />
+        </div>
+      )}
 
       {isOwner && (
         <>
@@ -2897,6 +2936,38 @@ function DonutChart({ slices, size = 120, thickness = 18 }) {
           return el;
         })}
       </g>
+    </svg>
+  );
+}
+// A simple SVG line/area chart of revenue over several consecutive periods, used for the
+// dashboard's growth trend. points: [{ label, value }], oldest first.
+function GrowthLineChart({ points, width = 300, height = 110 }) {
+  const pad = { top: 10, right: 10, bottom: 20, left: 10 };
+  const innerW = width - pad.left - pad.right;
+  const innerH = height - pad.top - pad.bottom;
+  const max = Math.max(...points.map((p) => p.value), 1);
+  const min = Math.min(...points.map((p) => p.value), 0);
+  const range = max - min || 1;
+  const stepX = points.length > 1 ? innerW / (points.length - 1) : 0;
+  const coords = points.map((p, i) => ({
+    x: pad.left + i * stepX,
+    y: pad.top + innerH - ((p.value - min) / range) * innerH,
+    ...p,
+  }));
+  const linePath = coords.map((c, i) => `${i === 0 ? "M" : "L"} ${c.x} ${c.y}`).join(" ");
+  const areaPath = `${linePath} L ${coords[coords.length - 1].x} ${pad.top + innerH} L ${coords[0].x} ${pad.top + innerH} Z`;
+  const rising = points.length > 1 && points[points.length - 1].value >= points[0].value;
+  const lineColor = rising ? "#22A06B" : "#B23A2E";
+  return (
+    <svg width="100%" height={height} viewBox={`0 0 ${width} ${height}`} preserveAspectRatio="none">
+      <path d={areaPath} fill={rising ? "rgba(34,160,107,0.12)" : "rgba(178,58,46,0.10)"} stroke="none" />
+      <path d={linePath} fill="none" stroke={lineColor} strokeWidth={2} strokeLinejoin="round" strokeLinecap="round" />
+      {coords.map((c, i) => (
+        <circle key={i} cx={c.x} cy={c.y} r={i === coords.length - 1 ? 3.5 : 2.5} fill={lineColor} />
+      ))}
+      {coords.map((c, i) => (
+        <text key={i} x={c.x} y={height - 4} fontSize="9" textAnchor={i === 0 ? "start" : i === coords.length - 1 ? "end" : "middle"} fill="var(--ink-faint)">{c.label}</text>
+      ))}
     </svg>
   );
 }
@@ -5538,6 +5609,31 @@ function periodSummary(biz, start, end) {
     revenue: orders.reduce((s, o) => s + o.total, 0),
     spent: expenses.reduce((s, e) => s + e.amount, 0),
   };
+}
+// Start/end of the Nth period back from now, for a given granularity — offset 0 is the
+// current (in-progress) period, 1 is the one before that, and so on. Used to build the
+// growth trend on the dashboard: revenue this period vs the same period before it.
+function periodBoundsFor(kind, offset) {
+  const now = new Date();
+  if (kind === "week") {
+    const d = new Date(now);
+    d.setDate(d.getDate() - offset * 7);
+    return [startOfWeek(d), endOfWeek(d)];
+  }
+  if (kind === "month" || kind === "all") {
+    const d = new Date(now.getFullYear(), now.getMonth() - offset, 1);
+    return [new Date(d.getFullYear(), d.getMonth(), 1), new Date(d.getFullYear(), d.getMonth() + 1, 0, 23, 59, 59, 999)];
+  }
+  // "today" — a day back per offset
+  const d = new Date(now);
+  d.setDate(d.getDate() - offset);
+  return [new Date(d.getFullYear(), d.getMonth(), d.getDate()), new Date(d.getFullYear(), d.getMonth(), d.getDate(), 23, 59, 59, 999)];
+}
+// Percent change from a previous value to a current one. null when there's nothing to
+// compare against (previous period had zero revenue) — shown as "New" rather than a number.
+function percentChange(current, previous) {
+  if (!previous) return current > 0 ? null : 0;
+  return ((current - previous) / previous) * 100;
 }
 
 function ActivityPanel({ biz, category, setTab }) {
