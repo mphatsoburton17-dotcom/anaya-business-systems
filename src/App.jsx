@@ -341,10 +341,10 @@ const TIERS = {
   },
   growth: {
     id: "growth", name: "Growth", price: 35000,
-    branchLimit: 5, seatLimit: 5,
+    branchLimit: 2, seatLimit: 2,
     hasAccounting: true, hasGrowth: true, hasHR: true, hasBranchMgmt: false,
     freeExtraBusinesses: 0,
-    desc: "Everything in Starter, plus Expenses, Suppliers, Purchase Orders, Reports, Accounting, Documents, and Staff & HR. Up to 5 branches and 5 staff logins.",
+    desc: "Everything in Starter, plus Expenses, Suppliers, Purchase Orders, Reports, Accounting, Documents, and Staff & HR. Up to 2 branches and 2 staff logins.",
   },
   pro: {
     id: "pro", name: "Pro", price: 50000, price3Month: 100000,
