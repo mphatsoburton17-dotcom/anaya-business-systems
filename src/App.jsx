@@ -326,38 +326,45 @@ const SESSION_KEY = "anaya:session";
 const SEAT_LIMITS = { solo: 1, small: 4, medium: 10, large: 999 }; // legacy — used only to migrate old accounts
 
 /* ---------------- packages / billing (placeholder — needs a real payment gateway) ----------------
-   Pricing model: three flat monthly tiers (Starter, Growth, Pro), each unlocking more of the app.
-   Starter can optionally add Accounting on its own for a smaller add-on price, without jumping to
-   the full Growth tier. Additional businesses (a second business under one login) are always a
-   separate purchase, except Pro includes one for free. */
-const TRIAL_DAYS = 7;
-const TIERS = {
-  starter: {
-    id: "starter", name: "Starter", price: 20000,
-    branchLimit: 1, seatLimit: 1,
-    hasAccounting: false, hasGrowth: false, hasHR: false, hasBranchMgmt: false,
-    freeExtraBusinesses: 0,
-    desc: "Sales, items, customers, quotes, calendar, and receipts — everything to run daily sales.",
+   Pricing model: a flat base plan (1 branch, 1 login), plus staff seats and branches bought as
+   add-ons. Buying several at once automatically finds the cheapest combination (a "bundle" of a
+   few units costs less per-unit than buying them one at a time) — the owner never has to think
+   about which deal to pick, the total just works out fair. Bundle prices start a little low on
+   purpose; raise SEAT_BUNDLE_PRICE / BRANCH_BUNDLE_PRICE later once people are used to the product. */
+const TRIAL_DAYS = 30;
+const BASE_PLAN_PRICE = 20000; // MWK / month — 1 branch, 1 login (the owner), all core features
+const SEAT_UNIT_PRICE = 5000;      // MWK / month, per extra staff login bought individually
+const SEAT_BUNDLE_SIZE = 4;
+const SEAT_BUNDLE_PRICE = 15000;   // MWK / month, per group of 4 extra seats (introductory price)
+const BRANCH_UNIT_PRICE = 10000;   // MWK / month, per extra branch bought individually
+const BRANCH_BUNDLE_SIZE = 3;
+const BRANCH_BUNDLE_PRICE = 25000; // MWK / month, per group of 3 extra branches (introductory price)
+function seatAddonCost(extraSeats) {
+  const n = Math.max(0, extraSeats || 0);
+  const bundles = Math.floor(n / SEAT_BUNDLE_SIZE);
+  const remainder = n % SEAT_BUNDLE_SIZE;
+  return bundles * SEAT_BUNDLE_PRICE + remainder * SEAT_UNIT_PRICE;
+}
+function branchAddonCost(extraBranches) {
+  const n = Math.max(0, extraBranches || 0);
+  const bundles = Math.floor(n / BRANCH_BUNDLE_SIZE);
+  const remainder = n % BRANCH_BUNDLE_SIZE;
+  return bundles * BRANCH_BUNDLE_PRICE + remainder * BRANCH_UNIT_PRICE;
+}
+const PACKAGES = {
+  accounting: {
+    id: "accounting",
+    name: "Accounting",
+    price: 10000,
+    desc: "Profit & loss, full ledger, accounts receivable, and a balance sheet snapshot.",
   },
   growth: {
-    id: "growth", name: "Growth", price: 35000,
-    branchLimit: 5, seatLimit: 5,
-    hasAccounting: true, hasGrowth: true, hasHR: true, hasBranchMgmt: false,
-    freeExtraBusinesses: 0,
-    desc: "Everything in Starter, plus Expenses, Suppliers, Purchase Orders, Reports, Accounting, Documents, and Staff & HR. Up to 5 branches and 5 staff logins.",
-  },
-  pro: {
-    id: "pro", name: "Pro", price: 50000, price3Month: 100000,
-    branchLimit: Infinity, seatLimit: Infinity,
-    hasAccounting: true, hasGrowth: true, hasHR: true, hasBranchMgmt: true,
-    freeExtraBusinesses: 1,
-    desc: "Everything in Growth, plus unlimited branches and staff logins, full Branches management, and one additional business included free.",
+    id: "growth",
+    name: "Growth",
+    price: 10000,
+    desc: "Marketing tools (flyers, broadcasts, content calendar) and auto-generated documents.",
   },
 };
-const ACCOUNTING_ADDON_PRICE = 10000; // MWK / month — lets a Starter plan add just Accounting, without upgrading to Growth
-function tierOf(biz) {
-  return TIERS[biz?.profile?.tier] || TIERS.starter;
-}
 function daysSince(ts) {
   return (Date.now() - (ts || 0)) / 86400000;
 }
@@ -367,55 +374,8 @@ function isTrialActive(profile) {
 function trialDaysLeft(profile) {
   return Math.max(0, Math.ceil(TRIAL_DAYS - daysSince(profile.createdAt)));
 }
-// Accounting is available on Growth/Pro automatically, or on Starter if the add-on was bought.
-function hasAccounting(biz) {
-  if (isTrialActive(biz.profile)) return true;
-  const t = tierOf(biz);
-  return t.hasAccounting || !!biz.profile.accountingAddon;
-}
-// Expenses, Suppliers, Purchase Orders, Reports, Activity, Documents — bundled together, Growth and up.
-function hasGrowthFeatures(biz) {
-  if (isTrialActive(biz.profile)) return true;
-  return tierOf(biz).hasGrowth;
-}
-function hasStaffHR(biz) {
-  if (isTrialActive(biz.profile)) return true;
-  return tierOf(biz).hasHR;
-}
-function hasBranchMgmt(biz) {
-  if (isTrialActive(biz.profile)) return true;
-  return tierOf(biz).hasBranchMgmt;
-}
-function seatLimitFor(biz) {
-  if (isTrialActive(biz.profile)) return Infinity;
-  return tierOf(biz).seatLimit;
-}
-function branchLimitFor(biz) {
-  if (isTrialActive(biz.profile)) return Infinity;
-  return tierOf(biz).branchLimit;
-}
-function freeExtraBusinessesFor(biz) {
-  if (isTrialActive(biz.profile)) return 1; // let them try a second business during the trial too
-  return tierOf(biz).freeExtraBusinesses;
-}
-// Downgrading never deletes anything — it locks the overflow instead. Whatever was created
-// first (branches, in creation order; the owner plus whoever was added first, for staff)
-// stays active; anything beyond the new plan's limit becomes locked until they upgrade again.
-function isBranchLocked(biz, branchId) {
-  const limit = branchLimitFor(biz);
-  if (limit === Infinity) return false;
-  const idx = (biz.branches || []).findIndex((b) => b.id === branchId);
-  return idx >= limit;
-}
-function isEmployeeLocked(biz, employeeId) {
-  const limit = seatLimitFor(biz);
-  if (limit === Infinity) return false;
-  const emp = (biz.employees || []).find((e) => e.id === employeeId);
-  if (!emp || emp.pin === "0000") return false; // the owner's own login is never locked
-  const nonOwnerLimit = Math.max(0, limit - 1); // the owner always takes one of the seats
-  const nonOwners = (biz.employees || []).filter((e) => e.pin !== "0000");
-  const idx = nonOwners.findIndex((e) => e.id === employeeId);
-  return idx >= nonOwnerLimit;
+function hasPackage(biz, packageId) {
+  return isTrialActive(biz.profile) || !!biz.profile.packages?.[packageId];
 }
 
 /* ---------------- branches ---------------- */
@@ -790,8 +750,9 @@ function emptyBusiness(name, categoryId, details = {}) {
       logoInitial: name?.[0]?.toUpperCase() || "A",
       phone: details.phone || "",
       location: details.location || "",
-      tier: TIERS[details.tier] ? details.tier : "starter", // starter | growth | pro
-      accountingAddon: !!details.accountingAddon, // Starter-only add-on; ignored once tier is growth/pro
+      extraSeats: Math.max(0, details.extraSeats || 0),
+      extraBranches: Math.max(0, details.extraBranches || 0),
+      packages: { accounting: !!details.packages?.accounting, growth: !!details.packages?.growth },
       branding: { logo: details.logo || null, primaryColor: details.primaryColor || "", secondaryColor: details.secondaryColor || "", address: details.location || "", signature: null },
       // "detailed" = every sale logged item-by-item. "totals" = just a running daily total,
       // for high-volume businesses where itemizing every sale isn't realistic. Set during
@@ -948,16 +909,9 @@ export default function App() {
       profile: {
         recordingMode: "detailed",
         ...biz_.profile,
-        // Best-effort migration from the old base-plan + seats/branches + packages model:
-        // a business that already had the old "growth" package, or had bought extra seats/
-        // branches, is mapped onto the closest new tier so nobody loses access they'd paid for.
-        tier: TIERS[biz_.profile.tier] ? biz_.profile.tier : (
-          biz_.profile.packages?.growth ? "growth"
-          : (biz_.profile.extraBranches >= 4 || biz_.profile.extraSeats >= 4) ? "pro"
-          : (biz_.profile.extraBranches > 0 || biz_.profile.extraSeats > 0) ? "growth"
-          : "starter"
-        ),
-        accountingAddon: biz_.profile.accountingAddon ?? !!biz_.profile.packages?.accounting,
+        extraSeats: biz_.profile.extraSeats ?? Math.max(0, (biz_.profile.seatLimit ?? SEAT_LIMITS[biz_.profile.staffSize] ?? 1) - 1),
+        extraBranches: biz_.profile.extraBranches ?? Math.max(0, branches.length - 1),
+        packages: { accounting: false, growth: false, ...biz_.profile.packages },
         branding: { logo: null, primaryColor: "", secondaryColor: "", address: biz_.profile?.location || "", signature: null, ...biz_.profile?.branding },
       },
     });
@@ -985,22 +939,6 @@ export default function App() {
     const migrated = await loadActiveBiz(account.userId);
     if (migrated) { setBiz(migrated); setSession(migrated.employees[0]?.id || null); setTab("overview"); }
     setSwitchingBusiness(false);
-  }, [account, loadActiveBiz]);
-
-  // Creates a brand-new business under this login and switches into it — shared by the
-  // PayChangu success handler below (paid extra business) and the free Pro perk in
-  // BusinessesPanel (1 additional business included at no charge on the Pro plan).
-  const createAndEnterBusiness = useCallback(async (shortId, name, categoryId) => {
-    const created = await createAdditionalBusinessRemote(shortId, name, categoryId);
-    if (created.error) return { ok: false, error: created.error };
-    const list = await fetchMyBusinesses(account.userId);
-    setMyBusinesses(list);
-    const switched = await switchActiveBusinessRemote(created.businessUuid);
-    if (switched.ok) {
-      const migrated = await loadActiveBiz(account.userId);
-      if (migrated) { setBiz(migrated); setSession(migrated.employees[0]?.id || null); setTab("overview"); }
-    }
-    return { ok: true };
   }, [account, loadActiveBiz]);
 
   const [recoverySession, setRecoverySession] = useState(null);
@@ -1083,10 +1021,17 @@ export default function App() {
       if (!result || cancelled) return;
       const { succeeded, pendingRecord, status } = result;
       if (succeeded && pendingRecord?.type === "new-business") {
-        const result = await createAndEnterBusiness(pendingRecord.shortId, pendingRecord.name, pendingRecord.categoryId);
-        if (!result.ok) {
-          alert(`Payment succeeded, but creating the business failed: ${result.error}. Please contact support — your payment went through.`);
+        const created = await createAdditionalBusinessRemote(pendingRecord.shortId, pendingRecord.name, pendingRecord.categoryId);
+        if (created.error) {
+          alert(`Payment succeeded, but creating the business failed: ${created.error}. Please contact support — your payment went through.`);
         } else {
+          const list = await fetchMyBusinesses(account.userId);
+          setMyBusinesses(list);
+          const switched = await switchActiveBusinessRemote(created.businessUuid);
+          if (switched.ok) {
+            const migrated = await loadActiveBiz(account.userId);
+            if (migrated) { setBiz(migrated); setSession(migrated.employees[0]?.id || null); setTab("overview"); }
+          }
           alert(`"${pendingRecord.name}" has been created and is ready to set up.`);
         }
       } else if (succeeded && pendingRecord?.type === "billing") {
@@ -1097,8 +1042,8 @@ export default function App() {
             ...current,
             profile: {
               ...current.profile,
-              tier: req.tier,
-              accountingAddon: req.tier === "starter" ? !!req.accountingAddon : false,
+              extraSeats: req.extraSeats, extraBranches: req.extraBranches,
+              packages: { ...current.profile.packages, ...req.packages },
             },
             billingRequests: [
               { id: uid("billreq"), ts: Date.now(), status: "confirmed", confirmedAt: Date.now(), requested: req, total: pendingRecord.total, note: "Paid via PayChangu" },
@@ -1141,7 +1086,7 @@ export default function App() {
       }
     })();
     return () => { cancelled = true; };
-  }, [biz, account, notify, loadActiveBiz, createAndEnterBusiness]);
+  }, [biz, account, notify, loadActiveBiz]);
 
   // Auto-logs any recurring expense templates (rent, subscriptions, etc.) that are due
   // and haven't been logged yet this month. Runs once per session, right after the
@@ -1256,58 +1201,44 @@ export default function App() {
           <CustomersPanel biz={biz} category={category} persist={persist} isOwner={isStaffView} setTab={setTab} />
         )}
         {tab === "suppliers" && (isOwner || isManager || hasModuleAccess(currentEmployee, "reports")) && (
-          hasGrowthFeatures(biz)
-            ? <SuppliersPanel biz={biz} category={category} persist={persist} setTab={setTab} />
-            : <PaywallScreen message="Suppliers is part of the Growth plan and above." setTab={setTab} />
+          <SuppliersPanel biz={biz} category={category} persist={persist} setTab={setTab} />
         )}
         {tab === "purchaseOrders" && (isOwner || isManager || hasModuleAccess(currentEmployee, "reports")) && (
-          hasGrowthFeatures(biz)
-            ? <PurchaseOrdersPanel biz={biz} category={category} persist={persist} notify={notify} setTab={setTab} />
-            : <PaywallScreen message="Purchase Orders is part of the Growth plan and above." setTab={setTab} />
+          <PurchaseOrdersPanel biz={biz} category={category} persist={persist} notify={notify} setTab={setTab} />
         )}
         {tab === "employees" && (isOwner || isManager || hasModuleAccess(currentEmployee, "hr")) && (
-          hasStaffHR(biz)
-            ? <EmployeesPanel biz={biz} category={category} persist={persist} setTab={setTab} currentEmployee={currentEmployee} />
-            : <PaywallScreen message="Staff & HR is part of the Growth plan and above." setTab={setTab} />
+          <EmployeesPanel biz={biz} category={category} persist={persist} setTab={setTab} currentEmployee={currentEmployee} />
         )}
         {tab === "branches" && (isOwner || hasModuleAccess(currentEmployee, "branches")) && (
-          hasBranchMgmt(biz)
-            ? <BranchesPanel biz={biz} category={category} persist={persist} setTab={setTab} currentEmployee={currentEmployee} />
-            : <PaywallScreen message="Managing multiple branches is a Pro plan feature." setTab={setTab} />
+          <BranchesPanel biz={biz} category={category} persist={persist} setTab={setTab} currentEmployee={currentEmployee} />
         )}
         {tab === "reports" && (isOwner || isManager || hasModuleAccess(currentEmployee, "reports")) && (
-          hasGrowthFeatures(biz)
-            ? <ReportsPanel biz={biz} category={category} setTab={setTab} />
-            : <PaywallScreen message="Reports is part of the Growth plan and above." setTab={setTab} />
+          <ReportsPanel biz={biz} category={category} setTab={setTab} />
         )}
         {tab === "expenses" && (isOwner || isManager || hasModuleAccess(currentEmployee, "reports")) && (
-          hasGrowthFeatures(biz)
-            ? <ExpensesPanel biz={biz} category={category} persist={persist} setTab={setTab} currentEmployee={currentEmployee} canEdit={isOwner || isManager || canEditModule(currentEmployee, "reports")} />
-            : <PaywallScreen message="Expenses tracking is part of the Growth plan and above." setTab={setTab} />
+          <ExpensesPanel biz={biz} category={category} persist={persist} setTab={setTab} currentEmployee={currentEmployee} canEdit={isOwner || isManager || canEditModule(currentEmployee, "reports")} />
         )}
         {tab === "activity" && (isOwner || isManager || hasModuleAccess(currentEmployee, "reports")) && (
-          hasGrowthFeatures(biz)
-            ? <ActivityPanel biz={biz} category={category} setTab={setTab} />
-            : <PaywallScreen message="The Activity log is part of the Growth plan and above." setTab={setTab} />
+          <ActivityPanel biz={biz} category={category} setTab={setTab} />
         )}
         {tab === "alerts" && (
           <AlertsPanel biz={biz} persist={persist} />
         )}
         {tab === "documents" && (isOwner || isManager || hasModuleAccess(currentEmployee, "marketing")) && (
-          hasGrowthFeatures(biz)
+          hasPackage(biz, "growth")
             ? <DocumentsPanel biz={biz} category={category} persist={persist} setTab={setTab} canEditBranding={isOwner} />
-            : <PaywallScreen message="Documents is part of the Growth plan and above." setTab={setTab} />
+            : <PaywallScreen packageId="growth" setTab={setTab} />
         )}
         {tab === "accounting" && (isOwner || isManager || hasModuleAccess(currentEmployee, "accounting")) && (
-          hasAccounting(biz)
+          hasPackage(biz, "accounting")
             ? <AccountingPanel biz={biz} category={category} persist={persist} setTab={setTab} />
-            : <PaywallScreen message={`Accounting isn't on your current plan. Upgrade to Growth, or add it to Starter for +${currency(ACCOUNTING_ADDON_PRICE)}/month.`} setTab={setTab} />
+            : <PaywallScreen packageId="accounting" setTab={setTab} />
         )}
         {tab === "billing" && isOwner && (
           <BillingPanel biz={biz} persist={persist} setTab={setTab} />
         )}
         {tab === "businesses" && isOwner && (
-          <BusinessesPanel myBusinesses={myBusinesses} biz={biz} switchBusiness={switchBusiness} switchingBusiness={switchingBusiness} setTab={setTab} createAndEnterBusiness={createAndEnterBusiness} />
+          <BusinessesPanel myBusinesses={myBusinesses} biz={biz} switchBusiness={switchBusiness} switchingBusiness={switchingBusiness} setTab={setTab} />
         )}
         {tab === "budget" && isOwner && (
           <BudgetPanel biz={biz} persist={persist} notify={notify} setTab={setTab} />
@@ -1461,7 +1392,7 @@ function LandingPage({ onGetStarted, onLogin }) {
 
         <div className="lp-two-col" style={{ position: "relative", zIndex: 1, display: "grid", gridTemplateColumns: "1.05fr 0.95fr", gap: 40, alignItems: "center" }}>
           <div>
-            <div style={s.eyebrowPill}><Sparkles size={13} /> Free for 7 days — every tool unlocked</div>
+            <div style={s.eyebrowPill}><Sparkles size={13} /> Free for 30 days — every tool unlocked</div>
             <h1 style={s.h1} className="lp-hero-title">The business system built for how small businesses actually run.</h1>
             <p style={s.lead}>Track sales, stock, staff, and real profit — whether you're counting every transaction or just too busy to stop and log one. One app, shaped around your business, not the other way around.</p>
             <div style={{ display: "flex", gap: 12, flexWrap: "wrap" }}>
@@ -1634,35 +1565,51 @@ function LandingPage({ onGetStarted, onLogin }) {
         <div style={s.wrap}>
           <Reveal>
             <div style={s.sectionLabel}>Simple pricing</div>
-            <h2 style={s.h2}>Pick the plan that fits your business.</h2>
-            <p style={s.sectionLead}>Three flat monthly plans, each unlocking more of the app. Every plan starts with a free 7-day trial, every tool unlocked.</p>
+            <h2 style={s.h2}>Pay for exactly what you run.</h2>
+            <p style={s.sectionLead}>One base plan, plus only the branches and staff logins you actually need. Every plan starts with a free first month, every tool unlocked.</p>
           </Reveal>
 
-          <div className="lp-two-col" style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 20, marginBottom: 20 }}>
-            {Object.values(TIERS).map((t, i) => (
-              <Reveal key={t.id} delay={i * 100}>
-                <div style={{ ...s.card, ...(t.id === "growth" ? { borderColor: BRAND.accent, borderWidth: 2 } : {}) }}>
-                  <div style={s.featureTitle}>{t.name} — {currency(t.price)}/month</div>
-                  {t.price3Month && <div style={{ fontSize: 13, color: BRAND.accent, fontWeight: 700, marginBottom: 8 }}>or {currency(t.price3Month)} for 3 months</div>}
-                  <div style={s.featureDesc}>{t.desc}</div>
-                  <div style={{ fontSize: 13, color: BRAND.inkFaint, marginTop: 10, fontWeight: 600 }}>
-                    {t.branchLimit === Infinity ? "Unlimited" : t.branchLimit} branch{t.branchLimit !== 1 ? "es" : ""} · {t.seatLimit === Infinity ? "unlimited" : t.seatLimit} staff login{t.seatLimit !== 1 ? "s" : ""}
-                  </div>
+          <Reveal>
+            <div style={{ ...s.card, marginBottom: 20, borderColor: BRAND.accent, borderWidth: 2 }}>
+              <div style={s.featureTitle}>Base plan — {currency(BASE_PLAN_PRICE)}/month</div>
+              <div style={s.featureDesc}>1 branch, 1 login (you). Sales, inventory, invoicing, expenses, staff, and reports — the full core system, nothing held back.</div>
+            </div>
+          </Reveal>
+
+          <div className="lp-two-col" style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 20, marginBottom: 20 }}>
+            <Reveal>
+              <div style={s.card}>
+                <div style={s.featureIconWrap}><Users size={22} color={BRAND.accent} /></div>
+                <div style={s.featureTitle}>Extra staff logins</div>
+                <div style={s.featureDesc}>{currency(SEAT_UNIT_PRICE)}/month each, or {currency(SEAT_BUNDLE_PRICE)} for a group of {SEAT_BUNDLE_SIZE} — whichever combination is cheapest is applied automatically as you add people.</div>
+              </div>
+            </Reveal>
+            <Reveal delay={100}>
+              <div style={s.card}>
+                <div style={s.featureIconWrap}><Store size={22} color={BRAND.accent} /></div>
+                <div style={s.featureTitle}>Extra branches</div>
+                <div style={s.featureDesc}>{currency(BRANCH_UNIT_PRICE)}/month each, or {currency(BRANCH_BUNDLE_PRICE)} for a group of {BRANCH_BUNDLE_SIZE} — same automatic best-price combination.</div>
+              </div>
+            </Reveal>
+          </div>
+
+          <Reveal>
+            <div style={{ ...s.sectionLabel, marginTop: 10 }}>Optional add-ons</div>
+          </Reveal>
+          <div className="lp-two-col" style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 20, marginBottom: 20 }}>
+            {Object.values(PACKAGES).map((pkg, i) => (
+              <Reveal key={pkg.id} delay={i * 100}>
+                <div style={s.card}>
+                  <div style={s.featureTitle}>{pkg.name} — {currency(pkg.price)}/month</div>
+                  <div style={s.featureDesc}>{pkg.desc}</div>
                 </div>
               </Reveal>
             ))}
           </div>
 
           <Reveal>
-            <div style={{ ...s.card, marginBottom: 20 }}>
-              <div style={s.featureTitle}>Just want Accounting on Starter?</div>
-              <div style={s.featureDesc}>Add it on its own for +{currency(ACCOUNTING_ADDON_PRICE)}/month, without upgrading to Growth.</div>
-            </div>
-          </Reveal>
-
-          <Reveal>
             <div style={{ background: BRAND.accentSoft, borderRadius: 16, padding: "18px 22px", display: "flex", alignItems: "center", gap: 10, color: BRAND.accent, fontWeight: 700, fontSize: 14.5 }}>
-              <Sparkles size={17} /> Free for your first 7 days on any plan — no card needed to start.
+              <Sparkles size={17} /> Free for your first 30 days on any combination above — no card needed to start.
             </div>
           </Reveal>
         </div>
@@ -1673,7 +1620,7 @@ function LandingPage({ onGetStarted, onLogin }) {
         <Reveal>
           <div style={{ ...s.wrap, textAlign: "center" }}>
             <h2 style={{ ...s.h2, fontSize: 38 }}>Start running your business on real numbers.</h2>
-            <p style={{ ...s.sectionLead, margin: "0 auto 30px" }}>Free for 7 days, every tool unlocked. No card needed to start.</p>
+            <p style={{ ...s.sectionLead, margin: "0 auto 30px" }}>Free for 30 days, every tool unlocked. No card needed to start.</p>
             <button style={s.bigBtn} onClick={onGetStarted}>Create your account <ChevronRight size={18} /></button>
           </div>
         </Reveal>
@@ -1937,7 +1884,8 @@ function Onboarding({ onCreate }) {
   const [ownerName, setOwnerName] = useState("");
   const [phone, setPhone] = useState("");
   const [location, setLocation] = useState("");
-  const [selectedTier, setSelectedTier] = useState("starter");
+  const [branchCount, setBranchCount] = useState(1);
+  const [staffCount, setStaffCount] = useState(1);
   const [logo, setLogo] = useState(null);
   const [primaryColor, setPrimaryColor] = useState("#1449B0");
   const [recordingMode, setRecordingMode] = useState("detailed");
@@ -1981,7 +1929,7 @@ function Onboarding({ onCreate }) {
     try {
       onCreate(name.trim(), categoryId, {
         ownerName: ownerName.trim(), phone: phone.trim(), location: location.trim(),
-        tier: selectedTier,
+        extraSeats: staffCount - 1, extraBranches: branchCount - 1,
         description: description.trim(), logo, primaryColor,
         recordingMode, categories: categoryTags,
         businessSubtypeId: subtypeId, businessSubtypeName: subtype?.name || "",
@@ -2248,29 +2196,36 @@ function Onboarding({ onCreate }) {
       {step === 4 && (
         <div style={styles.onboardCard}>
           <div style={styles.eyebrow}>Step 5 of {TOTAL_STEPS - 1}</div>
-          <h1 style={styles.h1}>Pick your plan</h1>
-          <p style={styles.helperText}>Your first 7 days are completely free with everything unlocked — nothing is charged today. You can switch plans anytime later in Packages &amp; billing.</p>
+          <h1 style={styles.h1}>Build your plan</h1>
+          <p style={styles.helperText}>Your first month is completely free on any plan — change any of this later in Packages & billing.</p>
 
-          <div style={styles.staffSizeGrid}>
-            {Object.values(TIERS).map((t) => {
-              const active = selectedTier === t.id;
-              return (
-                <button
-                  key={t.id}
-                  onClick={() => setSelectedTier(t.id)}
-                  style={{
-                    ...styles.staffSizeCard,
-                    borderColor: active ? "var(--accent, #1B4332)" : "var(--line)",
-                    background: active ? "var(--accent-soft, #E3EFE7)" : "var(--surface)",
-                  }}
-                >
-                  <div>{t.name} — {currency(t.price)}/month{t.price3Month ? ` (or ${currency(t.price3Month)} for 3 months)` : ""}</div>
-                  <div style={{ fontSize: 12.5, fontWeight: 400, color: "var(--ink-faint)", marginTop: 4, lineHeight: 1.4 }}>{t.desc}</div>
-                </button>
-              );
-            })}
+          <div style={styles.formCard}>
+            <div style={styles.listRowTitle}>How many branches?</div>
+            <div style={styles.listRowSub}>1 is included in the base plan. Extra branches: {BRANCH_UNIT_PRICE.toLocaleString()} each, or {BRANCH_BUNDLE_PRICE.toLocaleString()} per {BRANCH_BUNDLE_SIZE} — cheapest combination applied automatically.</div>
+            <div style={styles.stepperRow}>
+              <button style={styles.iconBtn} onClick={() => setBranchCount((n) => Math.max(1, n - 1))} disabled={branchCount <= 1}><X size={15} /></button>
+              <span style={styles.stepperValue}>{branchCount} branch{branchCount !== 1 ? "es" : ""}</span>
+              <button style={styles.iconBtn} onClick={() => setBranchCount((n) => n + 1)}><Plus size={15} /></button>
+            </div>
           </div>
-          <p style={{ ...styles.helperText, marginTop: -8 }}>On Starter, you can add Accounting on its own later for +{currency(ACCOUNTING_ADDON_PRICE)}/month, without upgrading to Growth.</p>
+
+          <div style={styles.formCard}>
+            <div style={styles.listRowTitle}>How many staff logins (including you)?</div>
+            <div style={styles.listRowSub}>1 is included in the base plan. Extra logins: {SEAT_UNIT_PRICE.toLocaleString()} each, or {SEAT_BUNDLE_PRICE.toLocaleString()} per {SEAT_BUNDLE_SIZE} — cheapest combination applied automatically.</div>
+            <div style={styles.stepperRow}>
+              <button style={styles.iconBtn} onClick={() => setStaffCount((n) => Math.max(1, n - 1))} disabled={staffCount <= 1}><X size={15} /></button>
+              <span style={styles.stepperValue}>{staffCount} login{staffCount !== 1 ? "s" : ""}</span>
+              <button style={styles.iconBtn} onClick={() => setStaffCount((n) => n + 1)}><Plus size={15} /></button>
+            </div>
+          </div>
+
+          <div style={styles.formCard}>
+            <div style={styles.listRowTitle}>{currency(BASE_PLAN_PRICE + branchAddonCost(branchCount - 1) + seatAddonCost(staffCount - 1))}/month</div>
+            <div style={styles.listRowSub}>
+              Base {currency(BASE_PLAN_PRICE)} + branches {currency(branchAddonCost(branchCount - 1))} + staff {currency(seatAddonCost(staffCount - 1))}
+            </div>
+            <div style={styles.listRowSub}>Free for your first 30 days — nothing is charged today. You can add accounting or marketing tools anytime after signing up.</div>
+          </div>
 
           <div style={styles.stepNavRow}>
             <button style={styles.backTextBtn} onClick={() => setStep(3)}>Back</button>
@@ -2321,7 +2276,7 @@ function Onboarding({ onCreate }) {
           <div style={styles.buildingSteps}>
             <BuildingStep done={setupPhase > 0} active={setupPhase === 0} label={`Configuring for ${category.name.toLowerCase()}`} />
             <BuildingStep done={setupPhase > 1} active={setupPhase === 1} label={`Loading ${category.itemLabelPlural.toLowerCase()}, ${category.orderNounPlural.toLowerCase()} & ${category.customerNounPlural.toLowerCase()}`} />
-            <BuildingStep done={setupPhase > 2} active={setupPhase === 2} label={selectedTier === "starter" ? "Setting up your owner account" : "Setting up staff roles & permissions"} />
+            <BuildingStep done={setupPhase > 2} active={setupPhase === 2} label={staffCount <= 1 ? "Setting up your owner account" : "Setting up staff roles & permissions"} />
             <BuildingStep done={setupPhase > 3} active={setupPhase === 3} label="Finalizing your dashboard" />
           </div>
           {setupError && <div style={styles.authError}>{setupError}</div>}
@@ -2360,10 +2315,6 @@ function TopBar({ biz, category, currentEmployee, onSwitchRole, persist }) {
   const activeBranchName = activeBranchId ? branches.find((b) => b.id === activeBranchId)?.name : "All branches";
 
   const setActiveBranch = (id) => {
-    if (id && isBranchLocked(biz, id)) {
-      alert("This branch is locked because your current plan doesn't have room for it. Upgrade your plan to select it again — nothing about the branch has been lost.");
-      return;
-    }
     persist({ ...biz, settings: { ...biz.settings, activeBranchId: id } });
   };
 
@@ -2375,10 +2326,6 @@ function TopBar({ biz, category, currentEmployee, onSwitchRole, persist }) {
   };
 
   const attemptSwitch = (emp) => {
-    if (isEmployeeLocked(biz, emp.id)) {
-      alert(`${emp.name}'s login is locked because your current plan doesn't have room for it. Upgrade your plan to reactivate it — nothing about their account has been lost.`);
-      return;
-    }
     if (emp.branchPassword) {
       setPendingSwitchId(emp.id);
       setSwitchPassword("");
@@ -2424,7 +2371,7 @@ function TopBar({ biz, category, currentEmployee, onSwitchRole, persist }) {
               onChange={(e) => setActiveBranch(e.target.value || null)}
             >
               <option value="">All branches</option>
-              {branches.map((b) => <option key={b.id} value={b.id}>{b.name}{isBranchLocked(biz, b.id) ? " (locked)" : ""}</option>)}
+              {branches.map((b) => <option key={b.id} value={b.id}>{b.name}</option>)}
             </select>
           )
         )}
@@ -2453,10 +2400,10 @@ function TopBar({ biz, category, currentEmployee, onSwitchRole, persist }) {
                 ) : (
                   <button
                     key={e.id}
-                    style={{ ...styles.roleDropdownItem, ...(isEmployeeLocked(biz, e.id) ? { opacity: 0.5 } : {}) }}
+                    style={styles.roleDropdownItem}
                     onClick={() => attemptSwitch(e)}
                   >
-                    {e.name} · {roleLabel(e.role, category)}{e.branchPassword ? " 🔒" : ""}{isEmployeeLocked(biz, e.id) ? " · Locked" : ""}
+                    {e.name} · {roleLabel(e.role, category)}{e.branchPassword ? " 🔒" : ""}
                   </button>
                 )
               ))}
@@ -3703,7 +3650,7 @@ function OrdersPanel({ biz, category, persist, notify, currentEmployee }) {
             value={customerName} onChange={(e) => { setCustomerName(e.target.value); if (formError) setFormError(""); }} />
 
           <div style={styles.paymentMethodRow}>
-            {["Cash", "Bank Transfer", "Mobile Money", ...(hasAccounting(biz) ? ["On credit"] : [])].map((m) => (
+            {["Cash", "Bank Transfer", "Mobile Money", ...(hasPackage(biz, "accounting") ? ["On credit"] : [])].map((m) => (
               <button key={m}
                 style={{ ...styles.paymentChip, ...(paymentMethod === m ? styles.paymentChipActive : {}) }}
                 onClick={() => setPaymentMethod(m)}>
@@ -3711,8 +3658,8 @@ function OrdersPanel({ biz, category, persist, notify, currentEmployee }) {
               </button>
             ))}
           </div>
-          {(paymentMethod === "Bank Transfer" || paymentMethod === "Mobile Money") && (
-            <input style={styles.textInput} placeholder="Reference / note (optional) — e.g. bank name, phone number, transaction ID"
+          {paymentMethod !== "On credit" && (
+            <input style={styles.textInput} placeholder="Reference note (optional) — e.g. bank ref, screenshot saved"
               value={paymentNote} onChange={(e) => setPaymentNote(e.target.value)} />
           )}
 
@@ -3824,7 +3771,7 @@ function InvoiceModal({ order, biz, category, onClose, onEdit }) {
             : <StatusBadge status={order.status} category={category} />}
           {order.paymentMethod && <span style={styles.invoicePaymentTag}>{order.paymentMethod}</span>}
         </div>
-        {order.paymentNote && <div style={{ ...styles.listRowSub, marginBottom: 12 }}>{order.paymentNote}</div>}
+        {order.paymentNote && <p style={{ ...styles.helperText, marginBottom: 0 }}>Note: {order.paymentNote}</p>}
         <div style={{ display: "flex", gap: 8 }}>
           <button style={{ ...styles.printBtn, flex: 1 }} onClick={() => window.print()}>
             <Printer size={15} /> Print / save as PDF
@@ -4115,7 +4062,7 @@ function QuotesPanel({ biz, category, persist, notify, currentEmployee, isOwner 
               <div style={{ ...styles.formCard, marginTop: 12, marginBottom: 0 }}>
                 <div style={styles.miniLabel}>Convert to a real sale</div>
                 <div style={styles.paymentMethodRow}>
-                  {["Cash", "On credit"].map((m) => (
+                  {["Cash", "Bank Transfer", "Mobile Money", "On credit"].map((m) => (
                     <button key={m} style={{ ...styles.paymentChip, ...(convertPaymentMethod === m ? styles.paymentChipActive : {}) }} onClick={() => setConvertPaymentMethod(m)}>{m}</button>
                   ))}
                 </div>
@@ -4316,7 +4263,7 @@ function EmployeesPanel({ biz, category, persist, setTab, currentEmployee }) {
   const [payFormId, setPayFormId] = useState(null); // employee id whose "add pay record" form is open
   const [payForm, setPayForm] = useState({ type: "salary", amount: "", note: "", date: new Date().toISOString().slice(0, 10) });
 
-  const seatLimit = seatLimitFor(biz);
+  const seatLimit = 1 + (biz.profile.extraSeats || 0);
   const atLimit = biz.employees.length >= seatLimit;
   const hasBranches = (biz.branches || []).length > 1;
 
@@ -4502,7 +4449,7 @@ function EmployeesPanel({ biz, category, persist, setTab, currentEmployee }) {
       </Callout>
 
       <div style={styles.seatMeter}>
-        <span>{biz.employees.length} of {seatLimit === Infinity ? "unlimited" : seatLimit} staff accounts used</span>
+        <span>{biz.employees.length} of {seatLimit} staff accounts used</span>
       </div>
 
       {atLimit && !editingId && (
@@ -4612,7 +4559,7 @@ function EmployeesPanel({ biz, category, persist, setTab, currentEmployee }) {
             <div style={{ flex: 1 }}>
               <button type="button" style={styles.staffRowHeader} onClick={() => setExpandedId(expandedId === e.id ? null : e.id)}>
                 <div>
-                  <div style={styles.listRowTitle}>{e.name}{e.position ? ` · ${e.position}` : ""}{isEmployeeLocked(biz, e.id) ? <span style={{ color: "#B23A2E", fontWeight: 700 }}> · Locked</span> : ""}</div>
+                  <div style={styles.listRowTitle}>{e.name}{e.position ? ` · ${e.position}` : ""}</div>
                   <div style={styles.listRowSub}>
                     {roleLabel(e.role, category)}{e.pin ? ` · PIN ${e.pin}` : ""} · {STATUS_LABEL[e.status || "fulltime"]}
                     {hasBranches && e.branchId && ` · ${biz.branches.find((b) => b.id === e.branchId)?.name || ""}`}
@@ -4735,7 +4682,7 @@ function BranchesPanel({ biz, category, persist, setTab, currentEmployee }) {
   const [assigningId, setAssigningId] = useState(null);
   const [assignForm, setAssignForm] = useState({ employeeId: "", idNumber: "", email: "", password: "" });
   const isOwner = currentEmployee?.role === "owner";
-  const branchLimit = branchLimitFor(biz);
+  const branchLimit = 1 + (biz.profile.extraBranches || 0);
   const atBranchLimit = biz.branches.length >= branchLimit;
 
   const startAdd = () => {
@@ -6404,13 +6351,15 @@ function AccountingPanel({ biz, category, persist, setTab }) {
 /* =========================================================
    PAYWALL (shown when a package isn't unlocked)
    ========================================================= */
-function PaywallScreen({ message, setTab }) {
+function PaywallScreen({ packageId, setTab }) {
+  const pkg = PACKAGES[packageId];
   return (
     <div style={styles.panel}>
       <BackRow onBack={() => setTab("more")} label="More" />
-      <EmptyState text={message || "This isn't included on your current plan."} icon={Lock} />
+      <EmptyState text={`${pkg.name} is a paid add-on — ${currency(pkg.price)}/month.`} icon={Lock} />
+      <p style={styles.helperText}>{pkg.desc}</p>
       <button style={styles.primaryBtnSmall} onClick={() => setTab("billing")}>
-        <Wallet size={16} /> View plans & upgrade
+        <Wallet size={16} /> View packages & activate
       </button>
     </div>
   );
@@ -6422,50 +6371,39 @@ function PaywallScreen({ message, setTab }) {
 function BillingPanel({ biz, persist, setTab }) {
   const trialActive = isTrialActive(biz.profile);
   const daysLeft = trialDaysLeft(biz.profile);
-  const currentTierId = TIERS[biz.profile.tier] ? biz.profile.tier : "starter";
-  const currentTier = TIERS[currentTierId];
+  const extraSeats = biz.profile.extraSeats || 0;
+  const extraBranches = biz.profile.extraBranches || 0;
   const branchesInUse = biz.branches.length;
-  const staffInUse = biz.employees.length;
+  const activePackages = biz.profile.packages || {};
 
-  const currentAddonActive = currentTierId === "starter" && !!biz.profile.accountingAddon;
-  const currentTotal = currentTier.price + (currentAddonActive ? ACCOUNTING_ADDON_PRICE : 0);
+  const currentTotal = BASE_PLAN_PRICE + seatAddonCost(extraSeats) + branchAddonCost(extraBranches)
+    + Object.values(PACKAGES).reduce((s, p) => s + (activePackages[p.id] ? p.price : 0), 0);
 
   // Requesting a change is staged locally first — nothing switches on until PayChangu
   // confirms the payment (see the PayChangu completion handler in the main App component).
+  const [reqSeats, setReqSeats] = useState(1 + extraSeats);
+  const [reqBranches, setReqBranches] = useState(1 + extraBranches);
+  const [reqPackages, setReqPackages] = useState({ ...activePackages });
   const [showRequestForm, setShowRequestForm] = useState(false);
-  const [reqTierId, setReqTierId] = useState(currentTierId);
-  const [reqAddon, setReqAddon] = useState(currentAddonActive);
-  const [reqProDuration, setReqProDuration] = useState("month"); // month | 3month — only matters for Pro
 
-  const reqTier = TIERS[reqTierId];
-  const requestedTotal = reqTierId === "pro" && reqProDuration === "3month"
-    ? reqTier.price3Month
-    : reqTier.price + (reqTierId === "starter" && reqAddon ? ACCOUNTING_ADDON_PRICE : 0);
-  const hasChange = reqTierId !== currentTierId || (reqTierId === "starter" && reqAddon !== currentAddonActive) || (reqTierId === "pro" && reqProDuration === "3month");
+  const requestedTotal = BASE_PLAN_PRICE + seatAddonCost(reqSeats - 1) + branchAddonCost(reqBranches - 1)
+    + Object.values(PACKAGES).reduce((s, p) => s + (reqPackages[p.id] ? p.price : 0), 0);
+  const hasChange = reqSeats !== (1 + extraSeats) || reqBranches !== (1 + extraBranches)
+    || Object.values(PACKAGES).some((p) => !!reqPackages[p.id] !== !!activePackages[p.id]);
 
-  const openRequestForm = () => {
-    setReqTierId(currentTierId);
-    setReqAddon(currentAddonActive);
-    setReqProDuration("month");
-    setShowRequestForm(true);
-  };
+  const toggleReqPackage = (id) => setReqPackages((p) => ({ ...p, [id]: !p[id] }));
 
   const [payingViaPayChangu, setPayingViaPayChangu] = useState(false);
-  // Downgrading is always allowed — nothing gets deleted. If the new plan has less room than
-  // what's already in use, the oldest branches/staff up to the new limit stay active and the
-  // rest lock automatically (unselectable, read-only) until they upgrade again.
-  const willLockBranches = reqTier.branchLimit < branchesInUse ? branchesInUse - reqTier.branchLimit : 0;
-  const willLockStaff = reqTier.seatLimit < staffInUse ? staffInUse - reqTier.seatLimit : 0;
   const payWithPayChangu = async () => {
     setPayingViaPayChangu(true);
-    const description = `Plan — ${reqTier.name}${reqTierId === "pro" && reqProDuration === "3month" ? " (3 months)" : "/month"}${reqTierId === "starter" && reqAddon ? " + Accounting add-on" : ""}`;
+    const description = `Plan — ${reqSeats} staff login(s), ${reqBranches} branch(es)${Object.values(PACKAGES).filter((p) => reqPackages[p.id]).map((p) => `, ${p.name}`).join("")}`;
     const result = await startPayChanguCheckout({
       amount: requestedTotal,
       businessName: biz.profile.name,
       description,
       pendingRecord: {
         type: "billing",
-        requested: { tier: reqTierId, accountingAddon: reqTierId === "starter" ? reqAddon : false },
+        requested: { extraSeats: reqSeats - 1, extraBranches: reqBranches - 1, packages: { ...reqPackages } },
         total: requestedTotal,
       },
     });
@@ -6481,86 +6419,56 @@ function BillingPanel({ biz, persist, setTab }) {
 
       <SectionTitle title="Your current plan" small />
       <div style={styles.formCard}>
-        <div style={styles.listRowTitle}>{currentTier.name} — {currency(currentTotal)}/month</div>
+        <div style={styles.listRowTitle}>{currency(currentTotal)}/month</div>
         <div style={styles.listRowSub}>
-          {currentTier.branchLimit === Infinity ? "Unlimited" : currentTier.branchLimit} branch{currentTier.branchLimit !== 1 ? "es" : ""} · {currentTier.seatLimit === Infinity ? "unlimited" : currentTier.seatLimit} staff login{currentTier.seatLimit !== 1 ? "s" : ""}
-          {currentAddonActive ? " · Accounting add-on" : ""}
-          {currentTierId === "pro" ? " · 1 additional business included free" : ""}
+          {1 + extraSeats} staff login{extraSeats !== 0 ? "s" : ""} · {1 + extraBranches} branch{extraBranches !== 0 ? "es" : ""}
+          {Object.values(PACKAGES).filter((p) => activePackages[p.id]).map((p) => ` · ${p.name}`).join("")}
         </div>
       </div>
 
       {trialActive && (
         <Callout icon={Wallet}>
-          You're on your free 7-day trial — every plan's features are unlocked. {daysLeft} day{daysLeft !== 1 ? "s" : ""} left.
+          You're on your free trial — every add-on below is unlocked. {daysLeft} day{daysLeft !== 1 ? "s" : ""} left.
         </Callout>
       )}
 
       {!showRequestForm ? (
-        <button style={styles.primaryBtnSmall} onClick={openRequestForm}>
-          <Plus size={16} /> Change plan
+        <button style={styles.primaryBtnSmall} onClick={() => { setReqSeats(1 + extraSeats); setReqBranches(1 + extraBranches); setReqPackages({ ...activePackages }); setShowRequestForm(true); }}>
+          <Plus size={16} /> Request a plan change
         </button>
       ) : (
         <div style={styles.formCard}>
-          <div style={styles.staffFormSectionLabel}>Choose a plan</div>
+          <div style={styles.staffFormSectionLabel}>What do you want?</div>
 
-          <div style={styles.staffSizeGrid}>
-            {Object.values(TIERS).map((t) => {
-              const active = reqTierId === t.id;
-              return (
-                <button
-                  key={t.id}
-                  onClick={() => setReqTierId(t.id)}
-                  style={{
-                    ...styles.staffSizeCard,
-                    borderColor: active ? "var(--accent, #1B4332)" : "var(--line)",
-                    background: active ? "var(--accent-soft, #E3EFE7)" : "var(--surface)",
-                  }}
-                >
-                  <div>{t.name} — {currency(t.price)}/month{t.price3Month ? ` (or ${currency(t.price3Month)}/3 months)` : ""}{t.id === currentTierId ? " · Current plan" : ""}</div>
-                  <div style={{ fontSize: 12.5, fontWeight: 400, color: "var(--ink-faint)", marginTop: 4, lineHeight: 1.4 }}>{t.desc}</div>
-                </button>
-              );
-            })}
+          <div style={styles.listRowSub}>Staff logins — {SEAT_UNIT_PRICE.toLocaleString()} each, or {SEAT_BUNDLE_PRICE.toLocaleString()} per {SEAT_BUNDLE_SIZE}, cheapest combination applied automatically.</div>
+          <div style={styles.stepperRow}>
+            <button style={styles.iconBtn} onClick={() => setReqSeats((n) => Math.max(1, n - 1))} disabled={reqSeats <= 1}><X size={15} /></button>
+            <span style={styles.stepperValue}>{reqSeats} login{reqSeats !== 1 ? "s" : ""}</span>
+            <button style={styles.iconBtn} onClick={() => setReqSeats((n) => n + 1)}><Plus size={15} /></button>
           </div>
 
-          {reqTierId === "starter" && (
-            <label style={{ ...styles.permissionRow, marginTop: 4 }}>
-              <input type="checkbox" checked={reqAddon} onChange={(e) => setReqAddon(e.target.checked)} />
+          <div style={{ ...styles.listRowSub, marginTop: 10 }}>Branches — {BRANCH_UNIT_PRICE.toLocaleString()} each, or {BRANCH_BUNDLE_PRICE.toLocaleString()} per {BRANCH_BUNDLE_SIZE}, cheapest combination applied automatically.</div>
+          <div style={styles.stepperRow}>
+            <button style={styles.iconBtn} onClick={() => setReqBranches((n) => Math.max(1, n - 1))} disabled={reqBranches <= branchesInUse}><X size={15} /></button>
+            <span style={styles.stepperValue}>{reqBranches} branch{reqBranches !== 1 ? "es" : ""}</span>
+            <button style={styles.iconBtn} onClick={() => setReqBranches((n) => n + 1)}><Plus size={15} /></button>
+          </div>
+
+          <div style={{ ...styles.staffFormSectionLabel, marginTop: 12 }}>Add-ons</div>
+          {Object.values(PACKAGES).map((pkg) => (
+            <label key={pkg.id} style={styles.permissionRow}>
+              <input type="checkbox" checked={!!reqPackages[pkg.id]} onChange={() => toggleReqPackage(pkg.id)} />
               <div>
-                <div style={styles.listRowTitle}>Add Accounting — +{currency(ACCOUNTING_ADDON_PRICE)}/month</div>
-                <div style={styles.listRowSub}>Profit & loss, ledger, receivables, and a balance sheet — without upgrading to Growth.</div>
+                <div style={styles.listRowTitle}>{pkg.name} — {currency(pkg.price)}/month</div>
+                <div style={styles.listRowSub}>{pkg.desc}</div>
               </div>
             </label>
-          )}
-
-          {reqTierId === "pro" && (
-            <>
-              <div style={{ ...styles.staffFormSectionLabel, marginTop: 12 }}>Billing period</div>
-              <div style={styles.paymentMethodRow}>
-                <button style={{ ...styles.paymentChip, ...(reqProDuration === "month" ? styles.paymentChipActive : {}) }} onClick={() => setReqProDuration("month")}>
-                  {currency(TIERS.pro.price)}/month
-                </button>
-                <button style={{ ...styles.paymentChip, ...(reqProDuration === "3month" ? styles.paymentChipActive : {}) }} onClick={() => setReqProDuration("3month")}>
-                  {currency(TIERS.pro.price3Month)}/3 months
-                </button>
-              </div>
-            </>
-          )}
+          ))}
 
           <div style={{ ...styles.formCard, marginTop: 12 }}>
-            <div style={styles.listRowTitle}>New total: {currency(requestedTotal)}{reqTierId === "pro" && reqProDuration === "3month" ? " for 3 months" : "/month"}</div>
+            <div style={styles.listRowTitle}>New total: {currency(requestedTotal)}/month</div>
             {!hasChange && <div style={styles.listRowSub}>This matches what you already have.</div>}
           </div>
-
-          {(willLockBranches > 0 || willLockStaff > 0) && (
-            <Callout icon={Lock} tone="warn">
-              This plan has room for {reqTier.branchLimit === Infinity ? "unlimited" : reqTier.branchLimit} branch{reqTier.branchLimit !== 1 ? "es" : ""} and {reqTier.seatLimit === Infinity ? "unlimited" : reqTier.seatLimit} staff login{reqTier.seatLimit !== 1 ? "s" : ""}.
-              {willLockBranches > 0 && ` ${willLockBranches} of your branches`}
-              {willLockBranches > 0 && willLockStaff > 0 && " and"}
-              {willLockStaff > 0 && ` ${willLockStaff} staff login${willLockStaff !== 1 ? "s" : ""}`}
-              {" "}will be locked (kept, but not selectable) until you upgrade again — nothing is deleted.
-            </Callout>
-          )}
 
           {hasChange && (
             <>
@@ -6581,7 +6489,7 @@ function BillingPanel({ biz, persist, setTab }) {
             {pastRequests.map((r) => (
               <div key={r.id} style={styles.listRow}>
                 <div>
-                  <div style={styles.listRowTitle}>{currency(r.total)} — {r.status}</div>
+                  <div style={styles.listRowTitle}>{currency(r.total)}/month — {r.status}</div>
                   <div style={styles.listRowSub}>{new Date(r.confirmedAt || r.ts).toLocaleDateString()}</div>
                 </div>
               </div>
@@ -6598,29 +6506,16 @@ function BillingPanel({ biz, persist, setTab }) {
 /* =========================================================
    BUSINESSES (multi-business accounts — owner only)
    ========================================================= */
-function BusinessesPanel({ myBusinesses, biz, switchBusiness, switchingBusiness, setTab, createAndEnterBusiness }) {
+function BusinessesPanel({ myBusinesses, biz, switchBusiness, switchingBusiness, setTab }) {
   const [showAddForm, setShowAddForm] = useState(false);
   const [newName, setNewName] = useState("");
   const [newCategoryId, setNewCategoryId] = useState(CATEGORIES[0].id);
   const [creating, setCreating] = useState(false);
 
-  // Pro includes 1 additional business free (2 total under one login) — everyone else,
-  // and any business beyond that free one, pays the standalone monthly price.
-  const freeAllowance = freeExtraBusinessesFor(biz);
-  const extraBusinessesSoFar = Math.max(0, myBusinesses.length - 1);
-  const nextOneIsFree = extraBusinessesSoFar < freeAllowance;
-
   const startAddBusiness = async () => {
     if (!newName.trim() || !newCategoryId) return;
     setCreating(true);
     const shortId = await generateBusinessIdRemote();
-    if (nextOneIsFree) {
-      const result = await createAndEnterBusiness(shortId, newName.trim(), newCategoryId);
-      setCreating(false);
-      if (!result.ok) { alert(result.error); return; }
-      setShowAddForm(false); setNewName("");
-      return;
-    }
     const result = await startPayChanguCheckout({
       amount: ADDITIONAL_BUSINESS_PRICE,
       businessName: newName.trim(),
@@ -6634,11 +6529,7 @@ function BusinessesPanel({ myBusinesses, biz, switchBusiness, switchingBusiness,
     <div style={styles.panel}>
       <BackRow onBack={() => setTab("more")} label="More" />
       <SectionTitle title="Businesses" />
-      <p style={styles.helperText}>
-        Every business under this login.{nextOneIsFree
-          ? " Your Pro plan includes one additional business free — add it below."
-          : ` Add another for ${currency(ADDITIONAL_BUSINESS_PRICE)}/month.`}
-      </p>
+      <p style={styles.helperText}>Every business under this login, and a way to add another for {currency(ADDITIONAL_BUSINESS_PRICE)}/month.</p>
 
       <SectionTitle title="Your businesses" small />
       <div style={styles.list}>
@@ -6667,17 +6558,13 @@ function BusinessesPanel({ myBusinesses, biz, switchBusiness, switchingBusiness,
         </button>
       ) : (
         <div style={{ ...styles.formCard, marginTop: 16 }}>
-          <p style={styles.helperText}>
-            A new business, fully separate from your others — its own items, sales, staff, and branches.{" "}
-            {nextOneIsFree ? "Included free on your Pro plan." : `${currency(ADDITIONAL_BUSINESS_PRICE)}/month, paid via PayChangu.`}
-          </p>
+          <p style={styles.helperText}>A new business, fully separate from your others — its own items, sales, staff, and branches. {currency(ADDITIONAL_BUSINESS_PRICE)}/month, paid via PayChangu.</p>
           <input style={styles.textInput} placeholder="Business name" value={newName} onChange={(e) => setNewName(e.target.value)} />
           <select style={styles.textInput} value={newCategoryId} onChange={(e) => setNewCategoryId(e.target.value)}>
             {CATEGORIES.map((c) => <option key={c.id} value={c.id}>{c.name}</option>)}
           </select>
           <button style={{ ...styles.primaryBtnSmall, opacity: (newName.trim() && !creating) ? 1 : 0.5 }} disabled={!newName.trim() || creating} onClick={startAddBusiness}>
-            {nextOneIsFree ? <Check size={16} /> : <Wallet size={16} />}
-            {creating ? "Creating…" : nextOneIsFree ? "Add business (free on Pro)" : `Pay ${currency(ADDITIONAL_BUSINESS_PRICE)} with PayChangu`}
+            <Wallet size={16} /> {creating ? "Opening PayChangu…" : `Pay ${currency(ADDITIONAL_BUSINESS_PRICE)} with PayChangu`}
           </button>
           <button style={{ ...styles.logoutBtn, marginTop: 8 }} onClick={() => setShowAddForm(false)}><X size={15} /> Cancel</button>
         </div>
@@ -7788,7 +7675,7 @@ function HelpPanel({ setTab }) {
   const faqs = [
     { q: "How do I add a new item or product?", a: `Go to ${"the Items tab"} and tap the + button. Fill in the name, price, and stock if you track it.` },
     { q: "How do I add a staff member?", a: "Go to Staff & HR (under More on phones, or the sidebar on desktop) and tap Add staff. You can assign them a role and a branch." },
-    { q: "Why can't I see Accounting, Documents, or Staff & HR?", a: "Those are part of the Growth and Pro plans. Check Packages & Billing to upgrade, or see if your free trial is still active. On Starter, you can also add Accounting on its own for a smaller monthly add-on." },
+    { q: "Why can't I see Accounting or Marketing?", a: "Those are paid add-ons. Check Packages & Billing to activate them, or see if your free trial is still active." },
     { q: "How do I give a customer a price quote before they buy?", a: "Use the Quotes & Estimates tab — build the quote from your items (or one-off lines like delivery), share it, then convert it to a real sale once they accept." },
     { q: "How do I see my bookings or rent due-dates on a calendar?", a: "Open the Calendar tab. Service businesses see bookings by day; Property businesses see rent due-dates, marked paid or overdue." },
     { q: "Where is my data stored?", a: "Right now, everything is saved on this device only, in this browser. It won't appear if you open the app on a different phone or computer — a real backend (coming later) will fix that." },
@@ -7874,11 +7761,7 @@ function SettingsPanel({ biz, category, persist, setTab, onLogout, account }) {
             <span>Business ID: <span style={{ fontFamily: "'IBM Plex Mono', monospace" }}>{biz.profile.businessId}</span></span>
           </div>
         )}
-        <div style={styles.seatMeter}>
-          Plan: {tierOf(biz).name}
-          {biz.profile.tier === "starter" && biz.profile.accountingAddon ? " + Accounting" : ""}
-          {" — "}{tierOf(biz).seatLimit === Infinity ? "unlimited" : tierOf(biz).seatLimit} staff seat{tierOf(biz).seatLimit !== 1 ? "s" : ""}, {tierOf(biz).branchLimit === Infinity ? "unlimited" : tierOf(biz).branchLimit} branch{tierOf(biz).branchLimit !== 1 ? "es" : ""}
-        </div>
+        <div style={styles.seatMeter}>Plan: {1 + (biz.profile.extraSeats || 0)} staff seat{(1 + (biz.profile.extraSeats || 0)) !== 1 ? "s" : ""}, {1 + (biz.profile.extraBranches || 0)} branch{(1 + (biz.profile.extraBranches || 0)) !== 1 ? "es" : ""}</div>
         <button style={styles.logoutBtn} onClick={onLogout}><LogOut size={15} /> Log out</button>
       </div>
 
@@ -8076,7 +7959,7 @@ function BottomNav({ tab, setTab, isOwner, unread, category }) {
     { id: "more", label: "More", icon: MoreHorizontal },
   ];
   const activeSet = {
-    more: ["more", "employees", "branches", "customers", "reports", "accounting", "marketing", "documents", "billing", "settings", "calculator", "expenses", "activity", "integrations", "help", "quotes", "calendar", "suppliers", "businesses", "budget", "purchaseOrders"],
+    more: ["more", "employees", "branches", "customers", "reports", "accounting", "documents", "billing", "settings", "calculator", "expenses", "activity", "help", "quotes", "calendar", "suppliers", "businesses", "budget", "purchaseOrders"],
   };
   return (
     <div style={styles.bottomNav} className="app-bottom-nav">
