@@ -14,14 +14,14 @@ import { supabase } from "./supabaseClient";
 
 const EXPENSE_CATEGORIES = [
   "Restocking / buying stock", "Rent", "Utilities", "Transport",
-  "Damages / loss", "Repairs & maintenance", "Marketing",
+  "Damages / loss", "Repairs & maintenance", "Marketing", "Refunds / returns",
   "Salaries & wages", "Staff loans / advances", "Other",
 ];
 // Property/Rentals businesses don't buy stock or pay themselves "rent" — their expenses
 // look more like the costs of maintaining and managing rented-out units.
 const PROPERTY_EXPENSE_CATEGORIES = [
   "Property maintenance & repairs", "Utilities (paid by landlord)", "Property taxes / rates",
-  "Insurance", "Legal & agent fees", "Marketing",
+  "Insurance", "Legal & agent fees", "Marketing", "Refunds / returns",
   "Salaries & wages", "Staff loans / advances", "Other",
 ];
 function expenseCategoriesFor(categoryId) {
@@ -427,6 +427,24 @@ function filterByBranch(list, branchId) {
 // everywhere rather than hiding them, so nothing already added disappears.
 function itemsForBranch(list, branchId) {
   return !branchId ? list : list.filter((x) => !x.branchId || x.branchId === branchId);
+}
+// Suggests how much to reorder for a low-stock item, based on how fast it's actually been
+// selling — average daily quantity sold over the last 30 days, times a 14-day buffer, minus
+// what's already on hand. Returns null when there's not enough recent sales history to base
+// a suggestion on, or when stock is already comfortably above that buffer.
+function suggestReorderQty(biz, item) {
+  if (item.stock === undefined) return null;
+  const lookbackDays = 30, bufferDays = 14;
+  const since = Date.now() - lookbackDays * 86400000;
+  let qtySold = 0;
+  (biz.orders || []).forEach((o) => {
+    if (o.ts < since || o.quickSale) return;
+    (o.items || []).forEach((line) => { if (line.itemId === item.id) qtySold += line.qty; });
+  });
+  if (qtySold <= 0) return null;
+  const avgDaily = qtySold / lookbackDays;
+  const suggested = Math.ceil(avgDaily * bufferDays) - (item.stock || 0);
+  return suggested > 0 ? { suggested, avgDaily } : null;
 }
 
 /* ---------------- image helpers (client-side only, no backend yet) ---------------- */
@@ -3161,6 +3179,8 @@ function ItemsPanel({ biz, category, persist, notify, isOwner }) {
   };
 
   const removeItem = (id) => {
+    const item = biz.items.find((i) => i.id === id);
+    if (!window.confirm(`Remove "${item?.name || "this item"}"? This can't be undone.`)) return;
     persist({ ...biz, items: biz.items.filter((i) => i.id !== id) });
   };
 
@@ -3382,6 +3402,14 @@ function ItemsPanel({ biz, category, persist, notify, isOwner }) {
                     {item.requiresPrescription && <span>{"  ·  "}Rx required</span>}
                     {item.barcode && <span>{"  ·  "}Barcode {item.barcode}</span>}
                   </div>
+                  {category.hasStock && item.stock !== undefined && item.stock <= item.lowStockAt && (() => {
+                    const reorder = suggestReorderQty(biz, item);
+                    return reorder ? (
+                      <div style={{ fontSize: 11.5, color: "var(--accent)", fontWeight: 600, marginTop: 2 }}>
+                        Selling ~{reorder.avgDaily < 1 ? reorder.avgDaily.toFixed(1) : Math.round(reorder.avgDaily)} {unitLabel(item.unit, true)}/day recently — consider reordering ~{reorder.suggested} {unitLabel(item.unit, reorder.suggested !== 1)}
+                      </div>
+                    ) : null;
+                  })()}
                 </div>
                 <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
                   {isOwner && category.hasStock && (
@@ -3816,7 +3844,9 @@ function OrdersPanel({ biz, category, persist, notify, currentEmployee }) {
               </div>
               <div style={styles.listRowRight}>
                 <div style={styles.mono}>{currency(o.total)}</div>
-                {o.paymentStatus === "credit"
+                {(o.refundedAmount || 0) > 0
+                  ? <span style={{ ...styles.badge, background: "rgba(178,58,46,0.12)", color: "#B23A2E" }}>{(o.refundedAmount || 0) >= o.total ? "Refunded" : "Partial refund"}</span>
+                  : o.paymentStatus === "credit"
                   ? <span style={{ ...styles.badge, background: "var(--gold-soft)", color: "#8A6D00" }}>Owing</span>
                   : <StatusBadge status={o.status} category={category} />}
               </div>
@@ -3825,13 +3855,19 @@ function OrdersPanel({ biz, category, persist, notify, currentEmployee }) {
         </div>
       )}
 
-      {invoiceOrder && <InvoiceModal order={invoiceOrder} biz={biz} category={category} onClose={() => setInvoiceOrder(null)} onEdit={() => startEdit(invoiceOrder)} />}
+      {invoiceOrder && <InvoiceModal order={invoiceOrder} biz={biz} category={category} persist={persist} notify={notify} onClose={() => setInvoiceOrder(null)} onEdit={() => startEdit(invoiceOrder)} onRefunded={setInvoiceOrder} />}
     </div>
   );
 }
 
-function InvoiceModal({ order, biz, category, onClose, onEdit }) {
+function InvoiceModal({ order, biz, category, persist, notify, onClose, onEdit, onRefunded }) {
   const branding = biz.profile.branding || {};
+  const alreadyRefunded = order.refundedAmount || 0;
+  const refundable = Math.max(0, order.total - alreadyRefunded);
+  const [showRefundForm, setShowRefundForm] = useState(false);
+  const [refundAmount, setRefundAmount] = useState(String(refundable));
+  const [refundNote, setRefundNote] = useState("");
+
   const shareReceipt = () => {
     const lines = [
       biz.profile.name,
@@ -3844,9 +3880,51 @@ function InvoiceModal({ order, biz, category, onClose, onEdit }) {
       order.taxAmount > 0 ? `Tax (${order.taxRate}%): +${currency(order.taxAmount)}` : "",
       `Total: ${currency(order.total)}`,
       order.paymentStatus === "credit" ? "Status: Owing" : "",
+      alreadyRefunded > 0 ? `Refunded: ${currency(alreadyRefunded)}` : "",
     ].filter(Boolean);
     shareText(`Receipt — ${biz.profile.name}`, lines.join("\n"));
   };
+
+  // Refunding logs the amount as a "Refunds / returns" expense — which already flows into
+  // every profit number everywhere (Reports, Accounting, Overview) — rather than editing the
+  // sale's own total, so the original sale record stays accurate. Itemized, stock-tracked
+  // sales also get the matching stock back, proportional to how much was refunded.
+  const submitRefund = () => {
+    const amt = Math.min(refundable, Math.max(0, Number(refundAmount) || 0));
+    if (amt <= 0) return;
+    const newRefundedAmount = alreadyRefunded + amt;
+    const fraction = order.total > 0 ? amt / order.total : 0;
+    let next = { ...biz };
+    if (category.hasStock && !order.quickSale) {
+      next = {
+        ...next,
+        items: next.items.map((it) => {
+          const line = order.items.find((c) => c.itemId === it.id);
+          if (!line || it.stock === undefined) return it;
+          const qtyBack = Math.round(line.qty * fraction);
+          return qtyBack > 0 ? { ...it, stock: it.stock + qtyBack } : it;
+        }),
+      };
+    }
+    const exp = {
+      id: uid("exp"), category: "Refunds / returns", amount: amt,
+      note: `Refund for ${order.customerName || "walk-in"} sale${refundNote.trim() ? " — " + refundNote.trim() : ""}`,
+      branchId: order.branchId || biz.settings?.activeBranchId || biz.branches?.[0]?.id || null,
+      ts: Date.now(), refundedOrderId: order.id,
+    };
+    const updatedOrder = { ...order, refundedAmount: newRefundedAmount };
+    next = {
+      ...next,
+      expenses: [exp, ...next.expenses],
+      orders: next.orders.map((o) => (o.id === order.id ? updatedOrder : o)),
+    };
+    next = notify(next, "refund", `Refunded ${currency(amt)}${newRefundedAmount >= order.total ? " (fully refunded)" : ""} for ${order.customerName || "walk-in"} sale`);
+    persist(next);
+    if (onRefunded) onRefunded(updatedOrder);
+    setShowRefundForm(false);
+    setRefundNote("");
+  };
+
   return (
     <div style={styles.modalOverlay} onClick={onClose}>
       <div style={styles.modalCard} onClick={(e) => e.stopPropagation()}>
@@ -3894,8 +3972,33 @@ function InvoiceModal({ order, biz, category, onClose, onEdit }) {
             ? <span style={{ ...styles.badge, background: "var(--gold-soft)", color: "#8A6D00" }}>Owing</span>
             : <StatusBadge status={order.status} category={category} />}
           {order.paymentMethod && <span style={styles.invoicePaymentTag}>{order.paymentMethod}</span>}
+          {alreadyRefunded > 0 && (
+            <span style={{ ...styles.badge, background: "rgba(178,58,46,0.12)", color: "#B23A2E" }}>
+              {refundable <= 0 ? "Refunded" : "Partially refunded"}
+            </span>
+          )}
         </div>
+        {alreadyRefunded > 0 && (
+          <div style={{ ...styles.listRowSub, marginBottom: 4 }}>{currency(alreadyRefunded)} refunded of {currency(order.total)}</div>
+        )}
         {order.paymentNote && <div style={{ ...styles.listRowSub, marginBottom: 12 }}>{order.paymentNote}</div>}
+
+        {showRefundForm && (
+          <div style={{ ...styles.formCard, marginTop: 4 }}>
+            <div style={styles.miniLabel}>Refund amount (up to {currency(refundable)})</div>
+            <input style={styles.textInput} type="number" min="0" max={refundable} value={refundAmount}
+              onChange={(e) => setRefundAmount(e.target.value)} />
+            <input style={styles.textInput} placeholder="Reason (optional)" value={refundNote} onChange={(e) => setRefundNote(e.target.value)} />
+            <p style={{ ...styles.helperText, marginTop: -8 }}>
+              Logged as a "Refunds / returns" expense{category.hasStock && !order.quickSale ? ", and the matching stock is added back." : "."}
+            </p>
+            <div style={{ display: "flex", gap: 8 }}>
+              <button style={styles.primaryBtnSmall} onClick={submitRefund}><Check size={16} /> Confirm refund</button>
+              <button style={styles.smallAddBtn} onClick={() => setShowRefundForm(false)}>Cancel</button>
+            </div>
+          </div>
+        )}
+
         <div style={{ display: "flex", gap: 8 }}>
           <button style={{ ...styles.printBtn, flex: 1 }} onClick={() => window.print()}>
             <Printer size={15} /> Print / save as PDF
@@ -3909,6 +4012,12 @@ function InvoiceModal({ order, biz, category, onClose, onEdit }) {
             </button>
           )}
         </div>
+        {refundable > 0 && !showRefundForm && (
+          <button style={{ ...styles.printBtn, background: "none", border: "1px solid var(--line)", color: "#B23A2E" }}
+            onClick={() => { setRefundAmount(String(refundable)); setShowRefundForm(true); }}>
+            <TrendingDown size={15} /> Refund this sale
+          </button>
+        )}
       </div>
     </div>
   );
@@ -4013,6 +4122,7 @@ function QuotesPanel({ biz, category, persist, notify, currentEmployee, isOwner 
   };
 
   const deleteQuote = (quote) => {
+    if (!window.confirm(`Delete quote ${quote.code}? This can't be undone.`)) return;
     persist({ ...biz, quotes: biz.quotes.filter((q) => q.id !== quote.id) });
     setViewingQuote(null);
   };
@@ -4270,6 +4380,8 @@ function CustomersPanel({ biz, category, persist, isOwner, setTab }) {
     setShowForm(false);
   };
   const removeCustomer = (id) => {
+    const cust = biz.customers.find((c) => c.id === id);
+    if (!window.confirm(`Remove ${cust?.name || "this " + category.customerNoun.toLowerCase()}? This can't be undone.`)) return;
     persist({ ...biz, customers: biz.customers.filter((c) => c.id !== id) });
   };
 
@@ -4472,6 +4584,8 @@ function EmployeesPanel({ biz, category, persist, setTab, currentEmployee }) {
   };
 
   const removeEmployee = (id) => {
+    const emp = biz.employees.find((e) => e.id === id);
+    if (!window.confirm(`Remove ${emp?.name || "this person"}? Their PIN will stop working and this can't be undone.`)) return;
     persist({ ...biz, employees: biz.employees.filter((e) => e.id !== id) });
   };
 
@@ -4837,6 +4951,8 @@ function BranchesPanel({ biz, category, persist, setTab, currentEmployee }) {
 
   const removeBranch = (id) => {
     if (biz.branches.length <= 1) return;
+    const branch = biz.branches.find((b) => b.id === id);
+    if (!window.confirm(`Remove ${branch?.name || "this branch"}? Its past sales and expenses stay on record, but the branch itself can't be brought back.`)) return;
     const next = { ...biz, branches: biz.branches.filter((b) => b.id !== id) };
     if (biz.settings?.activeBranchId === id) {
       next.settings = { ...biz.settings, activeBranchId: null };
@@ -5024,6 +5140,7 @@ function ExpensesPanel({ biz, category: bizCategory, persist, setTab, currentEmp
 
   const removeExpense = (id) => {
     if (isLocked || !canEdit) return;
+    if (!window.confirm("Remove this expense? This can't be undone.")) return;
     persist({ ...biz, expenses: biz.expenses.filter((e) => e.id !== id) });
   };
 
@@ -5046,6 +5163,7 @@ function ExpensesPanel({ biz, category: bizCategory, persist, setTab, currentEmp
     persist({ ...biz, recurringExpenses: recurringExpenses.map((r) => r.id === id ? { ...r, active: !r.active } : r) });
   };
   const removeRecurring = (id) => {
+    if (!window.confirm("Remove this recurring expense? It won't be logged automatically anymore.")) return;
     persist({ ...biz, recurringExpenses: recurringExpenses.filter((r) => r.id !== id) });
   };
 
@@ -5225,6 +5343,8 @@ function SuppliersPanel({ biz, category, persist, setTab }) {
     setShowForm(false);
   };
   const removeSupplier = (id) => {
+    const s = suppliers.find((x) => x.id === id);
+    if (!window.confirm(`Remove ${s?.name || "this supplier"}? Their restocking history stays on record, but the contact can't be brought back.`)) return;
     persist({ ...biz, suppliers: suppliers.filter((s) => s.id !== id) });
   };
 
@@ -5392,6 +5512,7 @@ function PurchaseOrdersPanel({ biz, category, persist, notify, setTab }) {
     setViewingPO({ ...po, status: "cancelled" });
   };
   const deletePO = (po) => {
+    if (!window.confirm(`Delete purchase order ${po.code}? This can't be undone.`)) return;
     persist({ ...biz, purchaseOrders: purchaseOrders.filter((p) => p.id !== po.id) });
     setViewingPO(null);
   };
@@ -6063,6 +6184,17 @@ function ReportsPanel({ biz, category, setTab }) {
   }));
   const topItems = Object.entries(salesByItem).sort((a, b) => b[1].qty - a[1].qty).slice(0, 5);
 
+  const byCustomer = {};
+  thisMonthOrders.forEach((o) => {
+    const key = o.customerName || "Walk-in";
+    if (key === "Walk-in") return; // walk-ins aren't a "customer" to rank
+    byCustomer[key] = (byCustomer[key] || 0) + o.total;
+  });
+  const topCustomers = Object.entries(byCustomer).sort((a, b) => b[1] - a[1]).slice(0, 5);
+
+  const taxCollected = thisMonthOrders.reduce((s, o) => s + (o.taxAmount || 0), 0);
+  const refundsTotal = thisMonthExpenses.filter((e) => e.category === "Refunds / returns").reduce((s, e) => s + e.amount, 0);
+
   const byEmployee = {};
   thisMonthOrders.forEach((o) => {
     const emp = biz.employees.find((e) => e.id === o.employeeId);
@@ -6216,6 +6348,19 @@ function ReportsPanel({ biz, category, setTab }) {
         <StatCard label="Payroll" value={currency(payrollCost)} />
         <StatCard label="Damages / loss" value={currency(damagesTotal)} />
       </div>
+      {refundsTotal > 0 && (
+        <div style={styles.statGrid}>
+          <StatCard label="Refunds / returns" value={currency(refundsTotal)} />
+        </div>
+      )}
+
+      <SectionTitle title="Tax" small />
+      <div style={styles.statGrid}>
+        <StatCard label="VAT / tax collected this month" value={currency(taxCollected)} />
+      </div>
+      {biz.settings?.taxRate > 0
+        ? <p style={{ ...styles.helperText, marginTop: -10 }}>Based on the {biz.settings.taxRate}% tax rate applied to sales, set in the Price calculator.</p>
+        : <p style={{ ...styles.helperText, marginTop: -10 }}>No tax rate is currently set — go to the Price calculator to set one if you need to charge and track VAT.</p>}
 
       {Object.keys(expenseByCategory).length > 0 && (
         <>
@@ -6283,6 +6428,20 @@ function ReportsPanel({ biz, category, setTab }) {
       {Object.keys(byEmployee).length === 0 ? <EmptyState text="No activity yet this month." icon={Users} /> : (
         <div style={styles.list}>
           {Object.entries(byEmployee).map(([name, total]) => (
+            <div key={name} style={styles.listRow}>
+              <div style={styles.listRowTitle}>{name}</div>
+              <div style={styles.mono}>{currency(total)}</div>
+            </div>
+          ))}
+        </div>
+      )}
+
+      <SectionTitle title={`Top ${category.customerNounPlural.toLowerCase()}`} small />
+      {topCustomers.length === 0 ? (
+        <EmptyState text={`No named ${category.customerNounPlural.toLowerCase()} recorded yet this month — walk-ins without a name aren't ranked here.`} icon={Users} />
+      ) : (
+        <div style={styles.list}>
+          {topCustomers.map(([name, total]) => (
             <div key={name} style={styles.listRow}>
               <div style={styles.listRowTitle}>{name}</div>
               <div style={styles.mono}>{currency(total)}</div>
@@ -6845,6 +7004,8 @@ function BudgetPanel({ biz, persist, notify, setTab }) {
   };
 
   const removeBudget = (id) => {
+    const b = budgets.find((x) => x.id === id);
+    if (!window.confirm(`Delete "${b?.name || "this budget"}"? All its categories and logged spending will be gone for good.`)) return;
     persist({ ...biz, personalBudgets: budgets.filter((b) => b.id !== id) });
     if (selectedId === id) setSelectedId(null);
   };
@@ -6969,7 +7130,10 @@ function BudgetDetail({ biz, persist, notify, budget, onBack, onDelete }) {
     setEntryForm({ categoryId: entryForm.categoryId, amount: "", note: "", date: toDateInputValue(new Date()) });
     setShowAddEntry(false);
   };
-  const removeEntry = (id) => updateBudget({ entries: (budget.entries || []).filter((e) => e.id !== id) });
+  const removeEntry = (id) => {
+    if (!window.confirm("Remove this logged spending entry?")) return;
+    updateBudget({ entries: (budget.entries || []).filter((e) => e.id !== id) });
+  };
 
   const addCategory = () => {
     if (!newCatName.trim()) return;
@@ -6978,6 +7142,8 @@ function BudgetDetail({ biz, persist, notify, budget, onBack, onDelete }) {
     setNewCatName(""); setNewCatPlanned("");
   };
   const removeCategory = (id) => {
+    const cat = budget.categories.find((c) => c.id === id);
+    if (!window.confirm(`Remove "${cat?.name || "this category"}"? Any spending already logged under it will be removed too.`)) return;
     updateBudget({ categories: budget.categories.filter((c) => c.id !== id), entries: (budget.entries || []).filter((e) => e.categoryId !== id) });
   };
   const setCategoryPlanned = (id, val) => {
