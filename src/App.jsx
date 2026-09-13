@@ -467,6 +467,33 @@ async function shareText(title, text) {
     alert(text);
   }
 }
+function addDays(date, n) {
+  const d = new Date(date);
+  d.setDate(d.getDate() + n);
+  return d;
+}
+// Best-effort cleanup of a phone number for use in wa.me / sms: links — strips
+// spaces, dashes, brackets, and keeps a leading "+" out of the wa.me path.
+function digitsOnly(phone) {
+  return (phone || "").replace(/[^\d+]/g, "");
+}
+// Free "click-to-chat" link — opens WhatsApp with the message pre-typed into the
+// chat box. The business owner still has to tap Send inside WhatsApp; this never
+// sends anything by itself, which is what keeps it free and keeps a human in control.
+function waLink(phone, message) {
+  const clean = digitsOnly(phone).replace(/^\+/, "");
+  return `https://wa.me/${clean}?text=${encodeURIComponent(message)}`;
+}
+function smsLink(phone, message) {
+  return `sms:${digitsOnly(phone)}?body=${encodeURIComponent(message)}`;
+}
+// Orders only store a customer's name — phone numbers live on the customer record,
+// so look it up there (same matching-by-name pattern used when orders create customers).
+function findCustomerPhone(biz, name) {
+  if (!name) return "";
+  const match = (biz.customers || []).find((c) => c.name?.toLowerCase() === name.trim().toLowerCase());
+  return match?.phone || "";
+}
 function fileToDataUrl(file) {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
@@ -1269,6 +1296,9 @@ export default function App() {
         )}
         {tab === "calendar" && (
           <CalendarPanel biz={biz} category={category} persist={persist} setTab={setTab} />
+        )}
+        {tab === "reminders" && (
+          <RemindersPanel biz={biz} category={category} persist={persist} />
         )}
         {tab === "customers" && (
           <CustomersPanel biz={biz} category={category} persist={persist} isOwner={isStaffView} setTab={setTab} />
@@ -2496,6 +2526,7 @@ function Sidebar({ biz, category, tab, setTab, isOwner, isManager, canSee, unrea
       rows: [
         { id: "overview", label: "Dashboard", icon: BarChart3, show: true },
         { id: "alerts", label: "Alerts", icon: Bell, badge: unread, show: true },
+        { id: "reminders", label: "Reminders", icon: MessageCircle, show: true },
         { id: "calendar", label: "Calendar", icon: CalendarClock, show: true },
       ],
     },
@@ -6142,6 +6173,149 @@ function CalendarPanel({ biz, category, persist, setTab }) {
 }
 
 /* =========================================================
+   REMINDERS — daily follow-ups: appointments & overdue payments.
+   Sending is always a manual tap (wa.me / sms: links) — nothing goes
+   out without the owner reviewing the message and tapping Send.
+   ========================================================= */
+function RemindersPanel({ biz, category, persist }) {
+  const today = new Date();
+  const tomorrow = addDays(today, 1);
+  const isServiceBiz = category.id === "service";
+  const branchOrders = filterByBranch(biz.orders, biz.settings?.activeBranchId);
+  const reminders = biz.reminders || {}; // { [key]: timestamp } — what's already been sent
+
+  // Appointments due a reminder: bookings dated tomorrow. This app treats a
+  // future-dated booking (Orders tab, dated ahead) as the scheduled appointment.
+  const upcomingAppointments = isServiceBiz
+    ? branchOrders.filter((o) => isSameDay(o.ts, tomorrow) && !o.refundedAmount)
+    : [];
+
+  // Group outstanding credit balances by customer so each person gets one
+  // reminder rather than one per sale.
+  const owedByCustomer = {};
+  branchOrders.filter((o) => o.paymentStatus === "credit").forEach((o) => {
+    const name = (o.customerName || "").trim();
+    if (!name) return;
+    if (!owedByCustomer[name]) owedByCustomer[name] = { name, total: 0 };
+    owedByCustomer[name].total += o.total;
+  });
+  const debtors = Object.values(owedByCustomer).sort((a, b) => b.total - a.total);
+
+  const [drafts, setDrafts] = useState({});
+  const draftFor = (key, fallback) => (drafts[key] !== undefined ? drafts[key] : fallback);
+  const setDraft = (key, val) => setDrafts((d) => ({ ...d, [key]: val }));
+
+  const defaultApptMessage = (o) =>
+    `Hi ${o.customerName || "there"}, reminder: you have ${article(category.orderNoun.toLowerCase())} ${category.orderNoun.toLowerCase()} tomorrow (${tomorrow.toLocaleDateString("default", { weekday: "long", month: "short", day: "numeric" })}) with ${biz.profile.name}.`;
+  const defaultDebtMessage = (d) =>
+    `Hi ${d.name}, this is a reminder that you owe ${currency(d.total)} to ${biz.profile.name}. Please pay when you're able — thank you!`;
+
+  const markSent = (key) => persist({ ...biz, reminders: { ...reminders, [key]: Date.now() } });
+
+  const sendRow = (key, name, message, method) => {
+    const phone = findCustomerPhone(biz, name);
+    if (phone) {
+      window.open(method === "sms" ? smsLink(phone, message) : waLink(phone, message), "_blank");
+    } else {
+      shareText(`Message for ${name || "customer"}`, message);
+    }
+    markSent(key);
+  };
+
+  const notificationSettings = biz.notificationSettings || {};
+  const toggleEmailSetting = (key) => persist({ ...biz, notificationSettings: { ...notificationSettings, [key]: !(notificationSettings[key] !== false) } });
+
+  const sentLabel = (sentAt) => sentAt ? `Sent ${new Date(sentAt).toLocaleDateString() === today.toLocaleDateString() ? "today" : new Date(sentAt).toLocaleDateString()} at ${new Date(sentAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}` : null;
+
+  const ReminderRow = ({ rowKey, title, sub, message, onChange, sentAt, onSend }) => (
+    <div style={{ ...styles.formCard, marginBottom: 10 }}>
+      <div style={styles.listRowTitle}>{title}</div>
+      <div style={styles.listRowSub}>{sub}</div>
+      <textarea style={{ ...styles.textArea, marginTop: 8, minHeight: 64 }} value={message} onChange={(e) => onChange(e.target.value)} />
+      <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
+        <button style={{ ...styles.primaryBtnSmall, width: "auto", padding: "9px 14px" }} onClick={() => onSend("wa")}>
+          <MessageCircle size={15} /> Send on WhatsApp
+        </button>
+        <button style={{ ...styles.primaryBtnSmall, width: "auto", padding: "9px 14px", background: "var(--surface)", color: "var(--ink-soft)", border: "1px solid var(--line)" }} onClick={() => onSend("sms")}>
+          <Phone size={15} /> SMS
+        </button>
+        {sentAt && <span style={{ fontSize: 11.5, color: "var(--ink-faint)" }}>{sentLabel(sentAt)} — tap again to resend</span>}
+      </div>
+    </div>
+  );
+
+  return (
+    <div style={styles.panel}>
+      <SectionTitle title="Reminders" />
+      <p style={styles.helperText}>
+        Today's follow-ups — appointments to confirm and payments to chase. Edit any message before sending; nothing goes out until you tap Send inside WhatsApp or Messages.
+      </p>
+
+      {isServiceBiz && (
+        <>
+          <SectionTitle title={`Tomorrow's ${category.orderNounPlural.toLowerCase()}`} small />
+          {upcomingAppointments.length === 0 ? (
+            <EmptyState text={`No ${category.orderNounPlural.toLowerCase()} scheduled for tomorrow yet.`} icon={CalendarClock} />
+          ) : (
+            <div style={styles.list}>
+              {upcomingAppointments.map((o) => {
+                const key = `appt_${o.id}`;
+                const message = draftFor(key, defaultApptMessage(o));
+                const phone = findCustomerPhone(biz, o.customerName);
+                return (
+                  <ReminderRow key={o.id} rowKey={key}
+                    title={o.customerName || "Walk-in"}
+                    sub={`${new Date(o.ts).toLocaleDateString("default", { weekday: "short", month: "short", day: "numeric" })}${phone ? ` · ${phone}` : " · No phone on file — will use your device's share sheet instead"}`}
+                    message={message} onChange={(v) => setDraft(key, v)}
+                    sentAt={reminders[key]}
+                    onSend={(method) => sendRow(key, o.customerName, message, method)} />
+                );
+              })}
+            </div>
+          )}
+        </>
+      )}
+
+      <SectionTitle title="Overdue payments" small />
+      {debtors.length === 0 ? (
+        <EmptyState text="No one owes you money right now." icon={HandCoins} />
+      ) : (
+        <div style={styles.list}>
+          {debtors.map((d) => {
+            const key = `debt_${d.name}_${toDateInputValue(today)}`;
+            const message = draftFor(key, defaultDebtMessage(d));
+            const phone = findCustomerPhone(biz, d.name);
+            return (
+              <ReminderRow key={d.name} rowKey={key}
+                title={d.name}
+                sub={`Owes ${currency(d.total)}${phone ? ` · ${phone}` : " · No phone on file — will use your device's share sheet instead"}`}
+                message={message} onChange={(v) => setDraft(key, v)}
+                sentAt={reminders[key]}
+                onSend={(method) => sendRow(key, d.name, message, method)} />
+            );
+          })}
+        </div>
+      )}
+
+      <SectionTitle title="Automatic email notifications" small />
+      <p style={styles.helperText}>These go to your account email with no action needed from you — turn either off any time.</p>
+      <button style={styles.themeRow} onClick={() => toggleEmailSetting("subscriptionEmails")}>
+        <div><div style={styles.listRowTitle}>Subscription renewal & payment emails</div><div style={styles.listRowSub}>Renewal reminders and payment receipts for your own plan</div></div>
+        <div style={{ ...styles.switchTrack, background: notificationSettings.subscriptionEmails !== false ? "var(--accent)" : "var(--line)" }}>
+          <div style={{ ...styles.switchThumb, transform: notificationSettings.subscriptionEmails !== false ? "translateX(18px)" : "translateX(0)" }} />
+        </div>
+      </button>
+      <button style={styles.themeRow} onClick={() => toggleEmailSetting("reportEmails")}>
+        <div><div style={styles.listRowTitle}>Weekly & monthly performance report</div><div style={styles.listRowSub}>Sales, profit, best-seller and top customer, by email</div></div>
+        <div style={{ ...styles.switchTrack, background: notificationSettings.reportEmails !== false ? "var(--accent)" : "var(--line)" }}>
+          <div style={{ ...styles.switchThumb, transform: notificationSettings.reportEmails !== false ? "translateX(18px)" : "translateX(0)" }} />
+        </div>
+      </button>
+    </div>
+  );
+}
+
+/* =========================================================
    REPORTS (owner only)
    ========================================================= */
 function ReportsPanel({ biz, category, setTab }) {
@@ -8235,6 +8409,7 @@ function MorePanel({ isOwner, isManager, currentEmployee, category, setTab }) {
       color: "#1B4332",
       rows: [
         { id: "quotes", label: "Quotes & Estimates", icon: ClipboardList, desc: "Give a formal price before a sale, then convert it once accepted", show: true },
+        { id: "reminders", label: "Reminders", icon: MessageCircle, desc: "Today's follow-ups — appointments to confirm, payments to chase", show: true },
         { id: "calendar", label: "Calendar", icon: CalendarClock, desc: category.id === "property" ? "Rent due-dates, paid vs overdue, month by month" : `Your ${category.orderNounPlural.toLowerCase()} laid out day by day`, show: true },
         { id: "customers", label: category.customerNounPlural, icon: Users, desc: `Everyone who's had ${article(category.orderNoun)} ${category.orderNoun.toLowerCase()} with you`, show: true },
         { id: "calculator", label: "Price calculator", icon: Calculator, desc: "Work out tax & discount, set defaults", show: true },
@@ -8338,7 +8513,7 @@ function BottomNav({ tab, setTab, isOwner, unread, category }) {
     { id: "more", label: "More", icon: MoreHorizontal },
   ];
   const activeSet = {
-    more: ["more", "employees", "branches", "customers", "reports", "accounting", "marketing", "documents", "billing", "settings", "calculator", "expenses", "activity", "integrations", "help", "quotes", "calendar", "suppliers", "businesses", "budget", "purchaseOrders"],
+    more: ["more", "employees", "branches", "customers", "reports", "accounting", "marketing", "documents", "billing", "settings", "calculator", "expenses", "activity", "integrations", "help", "quotes", "calendar", "reminders", "suppliers", "businesses", "budget", "purchaseOrders"],
   };
   return (
     <div style={styles.bottomNav} className="app-bottom-nav">
