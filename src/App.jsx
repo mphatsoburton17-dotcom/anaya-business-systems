@@ -7,7 +7,8 @@ import {
   CalendarDays, Lock, Mail, BookOpen, Wallet, HandCoins, Puzzle, HelpCircle, Phone, MessageCircle,
   Sparkles, Building2, Smartphone, Layers, Pencil, Share2,
   ShoppingCart, Shirt, Hammer, Sofa, Pill, Wheat, GraduationCap, UtensilsCrossed, Cookie, Beer, Car,
-  ClipboardList, Truck, CalendarClock, ChevronLeft, PiggyBank, PackageCheck, ScanLine
+  ClipboardList, Truck, CalendarClock, ChevronLeft, PiggyBank, PackageCheck, ScanLine,
+  Lightbulb, CheckCircle2
 } from "lucide-react";
 import * as XLSX from "xlsx";
 import { supabase } from "./supabaseClient";
@@ -1135,15 +1136,21 @@ export default function App() {
           alert(`"${pendingRecord.name}" has been created and is ready to set up.`);
         }
       } else if (succeeded && pendingRecord?.type === "billing") {
+        // A paid plan runs for a fixed period from the moment payment clears — a month,
+        // or 3 months for Pro's quarterly option — after which the renewal reminder
+        // email (sent by the send-subscription-emails function) kicks in.
+        const req = pendingRecord.requested;
+        const durationDays = req.tier === "pro" && req.proDuration === "3month" ? 90 : 30;
+        const newExpiresAt = Date.now() + durationDays * 86400000;
         setBiz((current) => {
           if (!current) return current;
-          const req = pendingRecord.requested;
           let next = {
             ...current,
             profile: {
               ...current.profile,
               tier: req.tier,
               accountingAddon: req.tier === "starter" ? !!req.accountingAddon : false,
+              subscriptionExpiresAt: newExpiresAt,
             },
             billingRequests: [
               { id: uid("billreq"), ts: Date.now(), status: "confirmed", confirmedAt: Date.now(), requested: req, total: pendingRecord.total, note: "Paid via PayChangu" },
@@ -1154,6 +1161,12 @@ export default function App() {
           persistBizForUser(account.userId, next);
           return next;
         });
+        // Fire-and-forget: tells the send-payment-confirmation Edge Function to email a
+        // receipt right away. It re-checks the notificationSettings toggle server-side too,
+        // so turning the toggle off is still respected even if this call fires anyway.
+        supabase.functions.invoke("send-payment-confirmation", {
+          body: { userId: account.userId, planName: TIERS[req.tier]?.name || req.tier, amount: pendingRecord.total, expiresAt: newExpiresAt },
+        }).catch((e) => console.error("payment confirmation email failed to trigger", e));
         alert(`Payment confirmed — your plan has been updated to ${currency(pendingRecord.total)}/month.`);
       } else if (succeeded && pendingRecord?.order) {
         setBiz((current) => {
@@ -2734,6 +2747,52 @@ function Overview({ biz, category, isOwner, setTab }) {
   const hasGrowthData = growthPoints.some((p) => p.value > 0);
   const growthKindLabel = growthKind === "today" ? "day over day" : growthKind === "week" ? "week over week" : "month over month";
 
+  // Receivables aging — money customers owe you, bucketed by how overdue it is.
+  // Same idea as the "Aging" panel in accounting dashboards: the older a balance
+  // gets, the more it should stand out visually.
+  const receivablesAging = (() => {
+    if (!hasAccounting(biz)) return null;
+    const creditOrders = branchOrders.filter((o) => o.paymentStatus === "credit");
+    if (creditOrders.length === 0) return null;
+    const buckets = { "1-30 days": 0, "31-60 days": 0, "61-90 days": 0, "Over 90 days": 0 };
+    const nowTs = Date.now();
+    creditOrders.forEach((o) => {
+      const daysOld = Math.floor((nowTs - o.ts) / 86400000);
+      const key = daysOld <= 30 ? "1-30 days" : daysOld <= 60 ? "31-60 days" : daysOld <= 90 ? "61-90 days" : "Over 90 days";
+      buckets[key] += o.total;
+    });
+    const total = Object.values(buckets).reduce((s, v) => s + v, 0);
+    return { buckets, total, overdueCount: creditOrders.length };
+  })();
+  const AGING_COLOR = { "1-30 days": "#E0A63A", "31-60 days": "#D97706", "61-90 days": "#C2410C", "Over 90 days": "#B23B3B" };
+
+  // A handful of plain-English takeaways, pulled from the numbers already on this
+  // page — the kind of thing an owner would want pointed out rather than having
+  // to read every chart themselves.
+  const insights = (() => {
+    if (!isOwner) return [];
+    const list = [];
+    if (growthPct !== null && hasGrowthData) {
+      list.push(`Revenue is ${growthPct >= 0 ? "up" : "down"} ${Math.abs(Math.round(growthPct))}% ${growthKindLabel} compared to the period before.`);
+    }
+    const topItem = (() => {
+      const counts = {};
+      thisMonth.orders.forEach((o) => (o.items || []).forEach((it) => { counts[it.name] = (counts[it.name] || 0) + (it.qty || 1); }));
+      return Object.entries(counts).sort((a, b) => b[1] - a[1])[0]?.[0];
+    })();
+    if (topItem) list.push(`${topItem} is your best-selling ${category.itemLabel.toLowerCase()} this month.`);
+    if (expenseBreakdown.slices[0]) {
+      list.push(`${expenseBreakdown.slices[0].label} is your biggest expense this month, at ${currency(expenseBreakdown.slices[0].value)}.`);
+    }
+    if (receivablesAging && receivablesAging.total > 0) {
+      list.push(`${receivablesAging.overdueCount} sale${receivablesAging.overdueCount !== 1 ? "s" : ""} on credit still owed — ${currency(receivablesAging.total)} outstanding.`);
+    }
+    if (lowStock.length > 0) {
+      list.push(`${lowStock.length} ${lowStock.length === 1 ? "item is" : "items are"} running low on stock.`);
+    }
+    return list.slice(0, 4);
+  })();
+
   return (
     <div style={styles.panel}>
       <SectionTitle title="Overview" />
@@ -2879,6 +2938,49 @@ function Overview({ biz, category, isOwner, setTab }) {
         </div>
       )}
 
+      {isOwner && insights.length > 0 && (
+        <div className="lift-card" style={{ ...styles.trendCard, background: "linear-gradient(135deg, rgba(20,73,176,0.06), rgba(20,73,176,0.02))" }}>
+          <div style={{ ...styles.trendHeaderRow, marginBottom: 10 }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+              <Lightbulb size={15} color="var(--accent)" />
+              <div style={{ ...styles.trendHeader, marginBottom: 0 }}>Insights</div>
+            </div>
+          </div>
+          <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+            {insights.map((line, i) => (
+              <div key={i} style={{ display: "flex", gap: 8, alignItems: "flex-start", fontSize: 13.5, color: "var(--ink)" }}>
+                <CheckCircle2 size={15} color="#22A06B" style={{ marginTop: 1, flexShrink: 0 }} />
+                <span>{line}</span>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {isOwner && receivablesAging && receivablesAging.total > 0 && (
+        <div className="lift-card" style={styles.trendCard}>
+          <div style={styles.trendHeaderRow}>
+            <div style={styles.trendHeader}>Receivables aging</div>
+            <span style={{ fontSize: 12, color: "var(--ink-faint)" }}>{receivablesAging.overdueCount} on credit</span>
+          </div>
+          <div style={{ ...styles.listRowTitle, marginBottom: 12 }}>{currency(receivablesAging.total)} outstanding</div>
+          <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+            {Object.entries(receivablesAging.buckets).map(([bucket, amt]) => (
+              <div key={bucket}>
+                <div style={{ display: "flex", justifyContent: "space-between", fontSize: 12.5, color: "var(--ink-soft)", marginBottom: 4 }}>
+                  <span>{bucket}</span>
+                  <span style={styles.mono}>{currency(amt)}</span>
+                </div>
+                <div style={{ height: 6, borderRadius: 3, background: "var(--bg)", overflow: "hidden" }}>
+                  <div style={{ height: "100%", width: `${Math.max(amt > 0 ? 3 : 0, (amt / receivablesAging.total) * 100)}%`, background: AGING_COLOR[bucket], borderRadius: 3 }} />
+                </div>
+              </div>
+            ))}
+          </div>
+          <button style={{ ...styles.calloutLink, marginTop: 12, color: "var(--accent)", display: "inline-flex", alignItems: "center", gap: 4 }} onClick={() => setTab("reminders")}>Send payment reminders <ChevronRight size={13} /></button>
+        </div>
+      )}
+
       {isOwner && lowStock.length > 0 && (
         <Callout icon={AlertTriangle} tone="warn">
           {lowStock.length} item{lowStock.length > 1 ? "s" : ""} running low on stock.
@@ -3018,6 +3120,26 @@ function GrowthLineChart({ points, width = 300, height = 110 }) {
         <text key={i} x={c.x} y={height - 4} fontSize="9" textAnchor={i === 0 ? "start" : i === coords.length - 1 ? "end" : "middle"} fill="var(--ink-faint)">{c.label}</text>
       ))}
     </svg>
+  );
+}
+// A simple horizontal bar list — label + value, bar length relative to the largest
+// value in the set. Used for "sales by branch" / "top customers" style breakdowns.
+function BarListChart({ data, color = "var(--accent)" }) {
+  const max = Math.max(...data.map((d) => d.value), 1);
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+      {data.map((d) => (
+        <div key={d.label}>
+          <div style={{ display: "flex", justifyContent: "space-between", fontSize: 12.5, color: "var(--ink-soft)", marginBottom: 4, gap: 8 }}>
+            <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{d.label}</span>
+            <span style={{ ...styles.mono, flexShrink: 0 }}>{currency(d.value)}</span>
+          </div>
+          <div style={{ height: 8, borderRadius: 4, background: "var(--bg)", overflow: "hidden" }}>
+            <div style={{ height: "100%", width: `${Math.max(3, (d.value / max) * 100)}%`, background: color, borderRadius: 4 }} />
+          </div>
+        </div>
+      ))}
+    </div>
   );
 }
 function QuickAction({ icon: Icon, label, onClick }) {
@@ -6394,6 +6516,55 @@ function ReportsPanel({ biz, category, setTab }) {
   const quickOrderCount = thisMonthOrders.filter((o) => o.quickSale).length;
   const isTotalsMode = biz.profile?.recordingMode === "totals";
 
+  // ---------------- Performance overview (visual summary above the detailed report) ----------------
+  const CATEGORY_PALETTE = ["#1449B0", "#22A06B", "#9D6FE8", "#E0A63A", "#B23B3B", "#0E7C7B", "#8A6D00", "#7A4FBF", "#2E6FE0", "#D97706"];
+  const categorySlices = Object.entries(byCategory).sort((a, b) => b[1] - a[1])
+    .map(([label, value], i) => ({ label, value, color: CATEGORY_PALETTE[i % CATEGORY_PALETTE.length] }));
+
+  // Revenue + order count for each of the last 6 months, for the trend line and the
+  // "orders by month" bars — periodSummary already scopes to the active branch.
+  const sixMonthTrend = Array.from({ length: 6 }, (_, i) => {
+    const offset = 5 - i;
+    const [start, end] = periodBoundsFor("month", offset);
+    const summary = periodSummary(biz, start, end);
+    return { label: start.toLocaleDateString("default", { month: "short" }), revenue: summary.revenue, orders: summary.orders.length };
+  });
+  const maxMonthlyOrders = Math.max(...sixMonthTrend.map((m) => m.orders), 1);
+
+  // New customers this month = anyone whose earliest-ever order falls in the current month.
+  const firstOrderByCustomer = {};
+  filterByBranch(biz.orders, biz.settings?.activeBranchId).forEach((o) => {
+    const name = o.customerName;
+    if (!name || name === "Walk-in") return;
+    if (!firstOrderByCustomer[name] || o.ts < firstOrderByCustomer[name]) firstOrderByCustomer[name] = o.ts;
+  });
+  const monthStartTs = new Date(now.getFullYear(), now.getMonth(), 1).getTime();
+  const newCustomersCount = Object.values(firstOrderByCustomer).filter((ts) => ts >= monthStartTs).length;
+
+  // "Sales by branch" only makes sense with more than one branch — otherwise fall back to
+  // top customers, which is meaningful for every business type.
+  const hasBranches = (biz.branches || []).length > 1;
+  const branchSlices = hasBranches ? (() => {
+    const monthEndTs = new Date(now.getFullYear(), now.getMonth() + 1, 0, 23, 59, 59, 999).getTime();
+    const totals = {};
+    (biz.orders || []).filter((o) => o.ts >= monthStartTs && o.ts <= monthEndTs).forEach((o) => {
+      const name = biz.branches.find((b) => b.id === o.branchId)?.name || "Unassigned";
+      totals[name] = (totals[name] || 0) + o.total;
+    });
+    return Object.entries(totals).sort((a, b) => b[1] - a[1]).map(([label, value]) => ({ label, value }));
+  })() : [];
+
+  const reportInsights = (() => {
+    const list = [];
+    const growth = percentChange(revenue, sixMonthTrend[4]?.revenue || 0); // last month = second-to-last point
+    if (growth !== null) list.push(`Sales are ${growth >= 0 ? "up" : "down"} ${Math.abs(Math.round(growth))}% from last month.`);
+    if (categorySlices[0]) list.push(`${categorySlices[0].label} is your top-selling category, at ${currency(categorySlices[0].value)}.`);
+    if (topCustomers[0]) list.push(`${topCustomers[0][0]} is your top ${category.customerNoun.toLowerCase()} this month, at ${currency(topCustomers[0][1])}.`);
+    if (newCustomersCount > 0) list.push(`${newCustomersCount} new ${category.customerNounPlural.toLowerCase()} this month — worth following up to turn them into regulars.`);
+    if (damagesTotal > 0) list.push(`${currency(damagesTotal)} lost to damages this month — worth a closer look.`);
+    return list.slice(0, 4);
+  })();
+
   const exportExcel = () => {
     const wb = XLSX.utils.book_new();
 
@@ -6495,6 +6666,89 @@ function ReportsPanel({ biz, category, setTab }) {
         <Callout icon={BarChart3} tone="info">
           You're set up to record daily totals — {quickOrderCount} of {thisMonthOrders.length} {category.orderNounPlural.toLowerCase()} this month {quickOrderCount === 1 ? "was" : "were"} logged as a total rather than itemized, so item- and category-level detail below only reflects the {detailedOrderCount} that were itemized. Change this anytime in Settings.
         </Callout>
+      )}
+
+      <SectionTitle title="Performance overview" small />
+      <div style={styles.statGrid} className="stat-grid">
+        <StatCard label="Total sales" value={currency(revenue)} icon={Wallet} tint="linear-gradient(135deg, #22A06B 0%, #146C43 100%)" />
+        <StatCard label="Net profit" value={currency(netProfit)} icon={TrendingUp} tint="linear-gradient(135deg, #2E6FE0 0%, #10399E 100%)" />
+        <StatCard label={category.orderNounPlural} value={String(thisMonthOrders.length)} icon={Receipt} tint="linear-gradient(135deg, #9D6FE8 0%, #6432B8 100%)" />
+        <StatCard label={`New ${category.customerNounPlural.toLowerCase()}`} value={String(newCustomersCount)} icon={Users} tint="linear-gradient(135deg, #E0A63A 0%, #A6690F 100%)" />
+      </div>
+
+      {sixMonthTrend.some((m) => m.revenue > 0) && (
+        <div className="lift-card" style={styles.trendCard}>
+          <div style={styles.trendHeader}>Sales trend — last 6 months</div>
+          <GrowthLineChart points={sixMonthTrend.map((m) => ({ label: m.label, value: m.revenue }))} />
+        </div>
+      )}
+
+      {(categorySlices.length > 0 || branchSlices.length > 0 || topCustomers.length > 0) && (
+        <div style={{ display: "flex", gap: 12, flexWrap: "wrap" }}>
+          {categorySlices.length > 0 && (
+            <div className="lift-card" style={{ ...styles.trendCard, flex: "1 1 260px" }}>
+              <div style={styles.trendHeader}>Sales by category</div>
+              <div style={styles.donutRow}>
+                <DonutChart slices={categorySlices} />
+                <div style={{ ...styles.paymentBreakdownList, flex: 1 }}>
+                  {categorySlices.slice(0, 5).map((s) => (
+                    <div key={s.label} style={styles.paymentBreakdownRow}>
+                      <span style={styles.trendLegendItem}><span style={{ ...styles.trendLegendDot, background: s.color }} />{s.label}</span>
+                      <span style={styles.mono}>{currency(s.value)}</span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            </div>
+          )}
+
+          {hasBranches && branchSlices.length > 0 ? (
+            <div className="lift-card" style={{ ...styles.trendCard, flex: "1 1 260px" }}>
+              <div style={styles.trendHeader}>Sales by branch</div>
+              <BarListChart data={branchSlices} />
+            </div>
+          ) : topCustomers.length > 0 ? (
+            <div className="lift-card" style={{ ...styles.trendCard, flex: "1 1 260px" }}>
+              <div style={styles.trendHeader}>Top {category.customerNounPlural.toLowerCase()}</div>
+              <BarListChart data={topCustomers.map(([name, amt]) => ({ label: name, value: amt }))} />
+            </div>
+          ) : null}
+        </div>
+      )}
+
+      {sixMonthTrend.some((m) => m.orders > 0) && (
+        <div className="lift-card" style={styles.trendCard}>
+          <div style={styles.trendHeader}>{category.orderNounPlural} by month</div>
+          <div style={styles.trendBars}>
+            {sixMonthTrend.map((m, i) => (
+              <div key={i} style={styles.trendBarCol}>
+                <div style={styles.trendBarTrack}>
+                  <div style={styles.trendBarPair}>
+                    <div style={{ ...styles.trendBarFill, height: `${Math.max(4, (m.orders / maxMonthlyOrders) * 100)}%` }} title={String(m.orders)} />
+                  </div>
+                </div>
+                <div style={styles.trendBarLabel}>{m.label}</div>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {reportInsights.length > 0 && (
+        <div className="lift-card" style={{ ...styles.trendCard, background: "linear-gradient(135deg, rgba(20,73,176,0.06), rgba(20,73,176,0.02))" }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 10 }}>
+            <Lightbulb size={15} color="var(--accent)" />
+            <div style={{ ...styles.trendHeader, marginBottom: 0 }}>Insights & recommendations</div>
+          </div>
+          <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+            {reportInsights.map((line, i) => (
+              <div key={i} style={{ display: "flex", gap: 8, alignItems: "flex-start", fontSize: 13.5, color: "var(--ink)" }}>
+                <CheckCircle2 size={15} color="#22A06B" style={{ marginTop: 1, flexShrink: 0 }} />
+                <span>{line}</span>
+              </div>
+            ))}
+          </div>
+        </div>
       )}
 
       <SectionTitle title="Sales summary" small />
@@ -6894,7 +7148,7 @@ function BillingPanel({ biz, persist, setTab }) {
       description,
       pendingRecord: {
         type: "billing",
-        requested: { tier: reqTierId, accountingAddon: reqTierId === "starter" ? reqAddon : false },
+        requested: { tier: reqTierId, accountingAddon: reqTierId === "starter" ? reqAddon : false, proDuration: reqTierId === "pro" ? reqProDuration : "month" },
         total: requestedTotal,
       },
     });
@@ -6916,6 +7170,12 @@ function BillingPanel({ biz, persist, setTab }) {
           {currentAddonActive ? " · Accounting add-on" : ""}
           {currentTierId === "pro" ? " · 1 additional business included free" : ""}
         </div>
+        {biz.profile.subscriptionExpiresAt && (
+          <div style={{ ...styles.listRowSub, marginTop: 4 }}>
+            {biz.profile.subscriptionExpiresAt < Date.now() ? "Expired on " : "Renews on "}
+            {new Date(biz.profile.subscriptionExpiresAt).toLocaleDateString("default", { month: "long", day: "numeric", year: "numeric" })}
+          </div>
+        )}
       </div>
 
       {trialActive && (
