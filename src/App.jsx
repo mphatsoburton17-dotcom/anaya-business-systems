@@ -1403,7 +1403,7 @@ export default function App() {
           <SettingsPanel biz={biz} category={category} persist={persist} setTab={setTab} onLogout={handleLogout} account={account} />
         )}
         {tab === "help" && (
-          <HelpPanel setTab={setTab} />
+          <HelpPanel setTab={setTab} biz={biz} account={account} />
         )}
         {tab === "more" && (
           <MorePanel isOwner={isOwner} isManager={isManager} currentEmployee={currentEmployee} category={category} setTab={setTab} />
@@ -8503,15 +8503,69 @@ function IntegrationsPanel({ setTab }) {
 /* =========================================================
    HELP
    ========================================================= */
-function HelpPanel({ setTab }) {
+function HelpPanel({ setTab, biz, account }) {
   const faqs = [
     { q: "How do I add a new item or product?", a: `Go to ${"the Items tab"} and tap the + button. Fill in the name, price, and stock if you track it.` },
     { q: "How do I add a staff member?", a: "Go to Staff & HR (under More on phones, or the sidebar on desktop) and tap Add staff. You can assign them a role and a branch." },
     { q: "Why can't I see Accounting, Documents, or Staff & HR?", a: "Those are part of the Growth and Pro plans. Check Packages & Billing to upgrade, or see if your free trial is still active. On Starter, you can also add Accounting on its own for a smaller monthly add-on." },
     { q: "How do I give a customer a price quote before they buy?", a: "Use the Quotes & Estimates tab — build the quote from your items (or one-off lines like delivery), share it, then convert it to a real sale once they accept." },
     { q: "How do I see my bookings or rent due-dates on a calendar?", a: "Open the Calendar tab. Service businesses see bookings by day; Property businesses see rent due-dates, marked paid or overdue." },
-    { q: "Where is my data stored?", a: "Right now, everything is saved on this device only, in this browser. It won't appear if you open the app on a different phone or computer — a real backend (coming later) will fix that." },
   ];
+
+  const [message, setMessage] = useState("");
+  const [screenshot, setScreenshot] = useState(null); // resized data URL, or null
+  const [sending, setSending] = useState(false);
+  const [sentJustNow, setSentJustNow] = useState(false);
+  const [myTickets, setMyTickets] = useState([]);
+  const [loadingTickets, setLoadingTickets] = useState(true);
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const { data } = await supabase.from("support_tickets").select("id, message, status, created_at").order("created_at", { ascending: false }).limit(10);
+        if (!cancelled) setMyTickets(data || []);
+      } catch {
+        // table may not exist yet, or the person is offline — fail quietly, this section is a nice-to-have
+      } finally {
+        if (!cancelled) setLoadingTickets(false);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [sentJustNow]);
+
+  const onScreenshotFile = async (e) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    const raw = await fileToDataUrl(file);
+    setScreenshot(await resizeDataUrl(raw, 900));
+  };
+
+  const submitTicket = async () => {
+    const clean = message.trim();
+    if (!clean) { alert("Add a short description of the problem first."); return; }
+    setSending(true);
+    try {
+      const { error } = await supabase.from("support_tickets").insert({
+        user_id: account?.userId,
+        user_email: account?.email,
+        business_name: biz?.profile?.name || "",
+        business_short_id: biz?.profile?.businessId || "",
+        message: clean,
+        screenshot,
+      });
+      if (error) throw error;
+      setMessage("");
+      setScreenshot(null);
+      setSentJustNow((n) => !n); // triggers the ticket list to refresh
+      alert("Sent — thanks for the report, we'll take a look.");
+    } catch (e) {
+      alert("Couldn't send that — check your connection and try again. If it keeps failing, the support_tickets table may not be set up yet.");
+    } finally {
+      setSending(false);
+    }
+  };
+
   return (
     <div style={styles.panel}>
       <BackRow onBack={() => setTab("overview")} label="Overview" />
@@ -8526,6 +8580,50 @@ function HelpPanel({ setTab }) {
           </div>
         ))}
       </div>
+
+      <SectionTitle title="Report a problem" small />
+      <p style={styles.helperText}>Ran into a bug, or something's not working right? Describe it below — a screenshot helps a lot if you can attach one.</p>
+      <div style={styles.formCard}>
+        <textarea
+          style={{ ...styles.textArea, minHeight: 90 }}
+          placeholder="What happened? What were you trying to do?"
+          value={message}
+          onChange={(e) => setMessage(e.target.value)}
+        />
+        {screenshot ? (
+          <div style={{ marginTop: 10, position: "relative", display: "inline-block" }}>
+            <img src={screenshot} alt="Screenshot to attach" style={{ maxWidth: "100%", borderRadius: 8, border: "1px solid var(--line)" }} />
+            <button style={{ ...styles.iconBtn, position: "absolute", top: 6, right: 6, background: "rgba(0,0,0,0.6)" }} onClick={() => setScreenshot(null)}>
+              <X size={14} color="#fff" />
+            </button>
+          </div>
+        ) : (
+          <label style={{ ...styles.calloutLink, marginTop: 10, color: "var(--accent)", display: "inline-flex", alignItems: "center", gap: 6, cursor: "pointer" }}>
+            <ScanLine size={15} /> Attach a screenshot
+            <input type="file" accept="image/*" style={{ display: "none" }} onChange={onScreenshotFile} />
+          </label>
+        )}
+        <button style={{ ...styles.primaryBtnSmall, marginTop: 14 }} disabled={sending} onClick={submitTicket}>
+          {sending ? "Sending…" : "Send report"}
+        </button>
+      </div>
+
+      {!loadingTickets && myTickets.length > 0 && (
+        <>
+          <SectionTitle title="Your reports" small />
+          <div style={styles.list}>
+            {myTickets.map((t) => (
+              <div key={t.id} style={styles.listRow}>
+                <div style={{ flex: 1 }}>
+                  <div style={styles.listRowTitle}>{t.message.length > 80 ? t.message.slice(0, 80) + "…" : t.message}</div>
+                  <div style={styles.listRowSub}>{new Date(t.created_at).toLocaleDateString()} · {t.status === "resolved" ? "Resolved" : "Open"}</div>
+                </div>
+              </div>
+            ))}
+          </div>
+        </>
+      )}
+
       <SectionTitle title="Contact" small />
       <div style={styles.list}>
         <div style={styles.listRow}>
