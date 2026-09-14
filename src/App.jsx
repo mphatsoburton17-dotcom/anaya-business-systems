@@ -963,6 +963,21 @@ export default function App() {
   const [tab, setTab] = useState("overview");
   const [myBusinesses, setMyBusinesses] = useState([]); // every business this login can access
   const [switchingBusiness, setSwitchingBusiness] = useState(false);
+  const [isOnline, setIsOnline] = useState(typeof navigator === "undefined" ? true : navigator.onLine);
+
+  // The app shell (this UI) works offline once installed, but saving or loading real
+  // business data still needs a connection — this just makes that honest instead of
+  // silently failing or spinning forever.
+  useEffect(() => {
+    const goOnline = () => setIsOnline(true);
+    const goOffline = () => setIsOnline(false);
+    window.addEventListener("online", goOnline);
+    window.addEventListener("offline", goOffline);
+    return () => {
+      window.removeEventListener("online", goOnline);
+      window.removeEventListener("offline", goOffline);
+    };
+  }, []);
 
   // Loads whichever business is currently "active" (profiles.business_id) for
   // this login, and applies the same migration/repair steps every time —
@@ -1285,6 +1300,14 @@ export default function App() {
         unread={biz.notifications.filter((n) => !n.read).length}
       />
       <div className="app-main">
+      {!isOnline && (
+        <div style={{
+          background: "#B23B3B", color: "#fff", fontSize: 12.5, fontWeight: 600,
+          textAlign: "center", padding: "6px 12px",
+        }}>
+          You're offline — the app is still open, but saving or loading data needs a connection. Reconnecting automatically…
+        </div>
+      )}
       <TopBar biz={biz} category={category} currentEmployee={currentEmployee} persist={persist}
         onSwitchRole={(empId) => {
           setSession(empId);
