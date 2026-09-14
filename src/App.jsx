@@ -337,22 +337,29 @@ const TIERS = {
     id: "starter", name: "Starter", price: 20000,
     branchLimit: 1, seatLimit: 1,
     hasAccounting: false, hasGrowth: false, hasHR: false, hasBranchMgmt: false,
-    freeExtraBusinesses: 0,
+    freeExtraBusinesses: 0, prioritySupport: false,
     desc: "Sales, items, customers, quotes, calendar, and receipts — everything to run daily sales.",
   },
   growth: {
     id: "growth", name: "Growth", price: 35000,
     branchLimit: 2, seatLimit: 2,
     hasAccounting: true, hasGrowth: true, hasHR: true, hasBranchMgmt: false,
-    freeExtraBusinesses: 0,
+    freeExtraBusinesses: 0, prioritySupport: false,
     desc: "Everything in Starter, plus Expenses, Suppliers, Purchase Orders, Reports, Accounting, Documents, and Staff & HR. Up to 2 branches and 2 staff logins.",
   },
   pro: {
     id: "pro", name: "Pro", price: 50000, price3Month: 100000,
     branchLimit: Infinity, seatLimit: Infinity,
     hasAccounting: true, hasGrowth: true, hasHR: true, hasBranchMgmt: true,
-    freeExtraBusinesses: 1,
+    freeExtraBusinesses: 1, prioritySupport: false,
     desc: "Everything in Growth, plus unlimited branches and staff logins, full Branches management, and one additional business included free.",
+  },
+  max: {
+    id: "max", name: "Max", price: 100000,
+    branchLimit: Infinity, seatLimit: Infinity,
+    hasAccounting: true, hasGrowth: true, hasHR: true, hasBranchMgmt: true,
+    freeExtraBusinesses: 3, prioritySupport: true,
+    desc: "Everything in Pro, plus 3 additional businesses included free and priority support — for owners running several businesses at once.",
   },
 };
 const ACCOUNTING_ADDON_PRICE = 10000; // MWK / month — lets a Starter plan add just Accounting, without upgrading to Growth
@@ -828,7 +835,12 @@ function emptyBusiness(name, categoryId, details = {}) {
   const mainBranchId = uid("branch");
   return {
     profile: {
-      name, categoryId, createdAt: Date.now(),
+      name, categoryId,
+      // Skipping the trial backdates createdAt past TRIAL_DAYS so isTrialActive() reads
+      // false immediately — the person goes straight into paid-tier behavior rather than
+      // getting a few bonus days of free access on top of skipping the wait.
+      createdAt: details.skipTrial ? Date.now() - (TRIAL_DAYS + 1) * 86400000 : Date.now(),
+      skippedTrial: !!details.skipTrial,
       businessId: details.businessId || null,
       description: details.description || "",
       businessSubtypeId: details.businessSubtypeId || null,
@@ -1110,6 +1122,9 @@ export default function App() {
     setAccount({ email, userId });
     setBiz(business);
     setSession(business.employees[0].id);
+    // Chose to skip the trial during signup — land them straight on payment instead
+    // of an empty dashboard, since that's the whole point of skipping the wait.
+    if (business.profile.skippedTrial) setTab("billing");
   };
 
   const handleLogin = async (identifier, password) => {
@@ -1402,6 +1417,9 @@ export default function App() {
         {tab === "settings" && isOwner && (
           <SettingsPanel biz={biz} category={category} persist={persist} setTab={setTab} onLogout={handleLogout} account={account} />
         )}
+        {tab === "terms" && (
+          <TermsScreen onBack={() => setTab("settings")} />
+        )}
         {tab === "help" && (
           <HelpPanel setTab={setTab} biz={biz} account={account} />
         )}
@@ -1493,7 +1511,7 @@ const LP_BUSINESS_TYPES = [
   { icon: Wrench, name: "Repair", examples: "Phone repair, mechanics, workshops, appliance fixes" },
 ];
 
-function LandingPage({ onGetStarted, onLogin }) {
+function LandingPage({ onGetStarted, onLogin, onShowTerms }) {
   const s = {
     page: { fontFamily: "'Inter', sans-serif", background: BRAND.bg, color: BRAND.ink, minHeight: "100vh", overflowX: "hidden" },
     wrap: { maxWidth: 1080, margin: "0 auto", padding: "0 24px" },
@@ -1766,14 +1784,117 @@ function LandingPage({ onGetStarted, onLogin }) {
       <div style={s.footer}>
         <div style={{ fontFamily: "'Fraunces', serif", fontSize: 18, color: BRAND.accent, fontWeight: 700, marginBottom: 6 }}>Anaya</div>
         Business Systems — built for small businesses.
+        <div style={{ marginTop: 10 }}>
+          <button style={{ background: "none", border: "none", color: BRAND.inkFaint, textDecoration: "underline", fontSize: 13, cursor: "pointer", fontFamily: "inherit" }} onClick={onShowTerms}>
+            Terms & Privacy
+          </button>
+        </div>
       </div>
     </div>
   );
 }
 
 /* =========================================================
-   RESET PASSWORD (shown after tapping a password-reset email link)
+   TERMS & PRIVACY
    ========================================================= */
+function TermsScreen({ onBack }) {
+  const s = {
+    wrap: { minHeight: "100vh", background: BRAND.bg, color: BRAND.ink, fontFamily: "'Inter', -apple-system, sans-serif" },
+    top: { position: "sticky", top: 0, background: BRAND.bg, borderBottom: `1px solid ${BRAND.line}`, padding: "16px 20px", zIndex: 2 },
+    backBtn: { background: "none", border: "none", color: BRAND.accent, fontWeight: 600, fontSize: 14.5, cursor: "pointer", display: "flex", alignItems: "center", gap: 4, padding: 0, fontFamily: "inherit" },
+    body: { maxWidth: 640, margin: "0 auto", padding: "32px 20px 60px" },
+    h1: { fontFamily: "'Fraunces', serif", fontSize: 30, margin: "0 0 6px 0" },
+    updated: { color: BRAND.inkFaint, fontSize: 13.5, marginBottom: 28 },
+    h2: { fontSize: 18, fontWeight: 700, margin: "30px 0 10px 0" },
+    p: { fontSize: 14.5, lineHeight: 1.7, color: BRAND.inkSoft, margin: "0 0 12px 0" },
+    li: { fontSize: 14.5, lineHeight: 1.7, color: BRAND.inkSoft, marginBottom: 6 },
+  };
+  return (
+    <div style={s.wrap}>
+      <style>{fontImports}</style>
+      <div style={s.top}>
+        <button style={s.backBtn} onClick={onBack}><ChevronLeft size={16} /> Back</button>
+      </div>
+      <div style={s.body}>
+        <h1 style={s.h1}>Terms & Privacy</h1>
+        <p style={s.updated}>Last updated: {new Date().toLocaleDateString("default", { month: "long", day: "numeric", year: "numeric" })}</p>
+
+        <p style={s.p}>
+          This is a plain-language summary of how Anaya Business Systems ("Anaya", "we", "us") works and what
+          happens with your data. It applies to anyone who creates a business account and uses the app.
+        </p>
+
+        <h2 style={s.h2}>1. What Anaya is</h2>
+        <p style={s.p}>
+          Anaya is a tool for small businesses to record sales, manage items and customers, track staff and
+          expenses, and generate reports and documents. You're responsible for the accuracy of the data you
+          enter — we don't independently verify your sales, stock, or financial records.
+        </p>
+
+        <h2 style={s.h2}>2. Accounts and trials</h2>
+        <ul style={{ margin: "0 0 12px 0", paddingLeft: 20 }}>
+          <li style={s.li}>You need a valid email and password to create an account. Keep your login details private — you're responsible for activity under your account.</li>
+          <li style={s.li}>New accounts get 7 days of full access before a paid plan is required, unless you chose to skip the trial and pay immediately.</li>
+          <li style={s.li}>You can have staff log into your business under their own profile, scoped to the permissions you give them.</li>
+        </ul>
+
+        <h2 style={s.h2}>3. Billing</h2>
+        <ul style={{ margin: "0 0 12px 0", paddingLeft: 20 }}>
+          <li style={s.li}>Paid plans (Starter, Growth, Pro, Max) are billed monthly (or quarterly, where offered) through PayChangu.</li>
+          <li style={s.li}>Your plan runs for the period you paid for. We'll email a reminder before it ends and again on the day it expires, unless you've turned those emails off.</li>
+          <li style={s.li}>If a plan lapses, some features may become unavailable until you renew — your data isn't deleted.</li>
+          <li style={s.li}>Refunds are handled case-by-case — contact us if something was charged in error.</li>
+        </ul>
+
+        <h2 style={s.h2}>4. Your data</h2>
+        <p style={s.p}>
+          Everything you enter — sales, customers, items, staff records, expenses — belongs to you. We store it
+          to provide the service and don't sell it to third parties. Only your account (and any staff you add)
+          can access your business's data; other businesses on Anaya can't see it.
+        </p>
+        <p style={s.p}>
+          We use Supabase for authentication and data storage, PayChangu for payments, and Resend for
+          transactional emails (receipts, reminders). These providers process data on our behalf under their
+          own security practices.
+        </p>
+
+        <h2 style={s.h2}>5. Communications you can control</h2>
+        <p style={s.p}>
+          Payment receipts and subscription-related emails are sent automatically. You can turn off renewal
+          reminders and performance report emails anytime from the Reminders tab. WhatsApp/SMS messages to your
+          customers are never sent automatically — you always review and tap Send yourself.
+        </p>
+
+        <h2 style={s.h2}>6. Acceptable use</h2>
+        <p style={s.p}>
+          Don't use Anaya for anything illegal, to store data you don't have the right to hold, or to attempt to
+          access another business's account or data. We may suspend accounts that violate this.
+        </p>
+
+        <h2 style={s.h2}>7. No warranty</h2>
+        <p style={s.p}>
+          Anaya is provided "as is." We work to keep it reliable, but we don't guarantee it will be uninterrupted
+          or error-free, and we're not liable for business losses arising from downtime, bugs, or data entry
+          mistakes. Keep your own backups of anything critical (exported reports, for example).
+        </p>
+
+        <h2 style={s.h2}>8. Changes</h2>
+        <p style={s.p}>
+          We may update these terms as the app changes. Continuing to use Anaya after an update means you accept
+          the revised terms.
+        </p>
+
+        <h2 style={s.h2}>9. Contact</h2>
+        <p style={s.p}>
+          Questions about these terms, your data, or a billing issue — use "Report a problem" in the Help tab, or
+          reach out through the support contact listed there.
+        </p>
+      </div>
+    </div>
+  );
+}
+
+
 function ResetPasswordScreen({ onDone }) {
   const [password, setPassword] = useState("");
   const [confirm, setConfirm] = useState("");
@@ -1848,6 +1969,7 @@ function AuthGate({ onRegister, onLogin, onEnter }) {
   const goRegisterCreds = () => { setError(""); setScreen("register-creds"); };
   const goLogin = () => { setError(""); setScreen("login"); };
   const goLanding = () => { setError(""); setScreen("landing"); };
+  const goTerms = () => { setError(""); setScreen("terms"); };
   const goForgot = () => { setError(""); setForgotSent(false); setForgotEmail(identifier.includes("@") ? identifier : ""); setScreen("forgot"); };
 
   const submitForgot = async () => {
@@ -1909,7 +2031,11 @@ function AuthGate({ onRegister, onLogin, onEnter }) {
   }
 
   if (screen === "landing") {
-    return <LandingPage onGetStarted={goRegisterCreds} onLogin={goLogin} />;
+    return <LandingPage onGetStarted={goRegisterCreds} onLogin={goLogin} onShowTerms={goTerms} />;
+  }
+
+  if (screen === "terms") {
+    return <TermsScreen onBack={goLanding} />;
   }
 
   return (
@@ -2022,6 +2148,7 @@ function Onboarding({ onCreate }) {
   const [phone, setPhone] = useState("");
   const [location, setLocation] = useState("");
   const [selectedTier, setSelectedTier] = useState("starter");
+  const [skipTrial, setSkipTrial] = useState(false);
   const [logo, setLogo] = useState(null);
   const [primaryColor, setPrimaryColor] = useState("#1449B0");
   const [recordingMode, setRecordingMode] = useState("detailed");
@@ -2065,7 +2192,7 @@ function Onboarding({ onCreate }) {
     try {
       onCreate(name.trim(), categoryId, {
         ownerName: ownerName.trim(), phone: phone.trim(), location: location.trim(),
-        tier: selectedTier,
+        tier: selectedTier, skipTrial,
         description: description.trim(), logo, primaryColor,
         recordingMode, categories: categoryTags,
         businessSubtypeId: subtypeId, businessSubtypeName: subtype?.name || "",
@@ -2355,6 +2482,19 @@ function Onboarding({ onCreate }) {
             })}
           </div>
           <p style={{ ...styles.helperText, marginTop: -8 }}>On Starter, you can add Accounting on its own later for +{currency(ACCOUNTING_ADDON_PRICE)}/month, without upgrading to Growth.</p>
+
+          <button
+            style={{ ...styles.themeRow, marginTop: 4 }}
+            onClick={() => setSkipTrial((v) => !v)}
+          >
+            <div>
+              <div style={styles.listRowTitle}>Skip the trial — pay now instead</div>
+              <div style={styles.listRowSub}>Already know you want this? Go straight to payment instead of the 7-day trial.</div>
+            </div>
+            <div style={{ ...styles.switchTrack, background: skipTrial ? "var(--accent)" : "var(--line)" }}>
+              <div style={{ ...styles.switchThumb, transform: skipTrial ? "translateX(18px)" : "translateX(0)" }} />
+            </div>
+          </button>
 
           <div style={styles.stepNavRow}>
             <button style={styles.backTextBtn} onClick={() => setStep(3)}>Back</button>
@@ -4356,6 +4496,19 @@ function QuotesPanel({ biz, category, persist, notify, currentEmployee, isOwner 
       </div>
       <p style={styles.helperText}>Give a customer a formal price before they commit — for existing {category.itemLabelPlural.toLowerCase()} or one-off lines like delivery. Convert it into a real sale the moment they say yes.</p>
 
+      {branchQuotes.length > 0 && (() => {
+        const pending = branchQuotes.filter((q) => q.status === "sent" && !quoteIsExpired(q));
+        const converted = branchQuotes.filter((q) => q.status === "converted");
+        const pendingValue = pending.reduce((s, q) => s + q.total, 0);
+        const conversionRate = branchQuotes.length ? Math.round((converted.length / branchQuotes.length) * 100) : 0;
+        return (
+          <div style={styles.statGrid}>
+            <StatCard label="Awaiting reply" value={currency(pendingValue)} sub={`${pending.length} quote${pending.length !== 1 ? "s" : ""}`} />
+            <StatCard label="Converted to sales" value={`${conversionRate}%`} sub={`${converted.length} of ${branchQuotes.length}`} />
+          </div>
+        );
+      })()}
+
       {showForm && (
         <div style={styles.formCard}>
           <div style={styles.formRow}>
@@ -4524,6 +4677,7 @@ function CustomersPanel({ biz, category, persist, isOwner, setTab }) {
   const [editingId, setEditingId] = useState(null);
   const [form, setForm] = useState({ name: "", phone: "" });
   const [expandedId, setExpandedId] = useState(null);
+  const [sortBy, setSortBy] = useState("recent"); // recent | top | az
 
   const stats = (cust) => {
     const orders = biz.orders.filter((o) => (o.customerName || "").trim().toLowerCase() === cust.name.trim().toLowerCase());
@@ -4572,6 +4726,12 @@ function CustomersPanel({ biz, category, persist, isOwner, setTab }) {
   };
 
   const filtered = biz.customers.filter((c) => c.name.toLowerCase().includes(query.toLowerCase()));
+  const sorted = [...filtered].sort((a, b) => {
+    if (sortBy === "az") return a.name.localeCompare(b.name);
+    if (sortBy === "top") return stats(b).totalSpent - stats(a).totalSpent;
+    return 0; // "recent" — already newest-first from how the array is built
+  });
+  const totalRevenueFromCustomers = biz.customers.reduce((s, c) => s + stats(c).totalSpent, 0);
 
   return (
     <div style={styles.panel}>
@@ -4584,6 +4744,13 @@ function CustomersPanel({ biz, category, persist, isOwner, setTab }) {
           </button>
         )}
       </div>
+
+      {biz.customers.length > 0 && (
+        <div style={styles.statGrid}>
+          <StatCard label={category.customerNounPlural} value={biz.customers.length} />
+          <StatCard label="Total spent (all time)" value={currency(totalRevenueFromCustomers)} />
+        </div>
+      )}
 
       {showForm && (
         <div style={styles.formCard}>
@@ -4606,8 +4773,17 @@ function CustomersPanel({ biz, category, persist, isOwner, setTab }) {
                 value={query} onChange={(e) => setQuery(e.target.value)} />
             </div>
           )}
+          {biz.customers.length > 1 && (
+            <div style={{ display: "flex", gap: 8, marginBottom: 12 }}>
+              {[["recent", "Recent"], ["top", "Top spenders"], ["az", "A–Z"]].map(([id, label]) => (
+                <button key={id} type="button"
+                  style={{ ...styles.paymentChip, flex: "none", ...(sortBy === id ? { background: "var(--accent)", color: "#fff", borderColor: "var(--accent)" } : {}) }}
+                  onClick={() => setSortBy(id)}>{label}</button>
+              ))}
+            </div>
+          )}
           <div style={styles.list}>
-            {filtered.map((c) => {
+            {sorted.map((c) => {
               const { totalSpent, lastOrder, orderCount } = stats(c);
               const isExpanded = expandedId === c.id;
               return (
@@ -5350,6 +5526,12 @@ function ExpensesPanel({ biz, category: bizCategory, persist, setTab, currentEmp
   });
   const totalThisMonth = thisMonthExpenses.reduce((s, e) => s + e.amount, 0);
   const damagesThisMonth = thisMonthExpenses.filter((e) => e.category === "Damages / loss").reduce((s, e) => s + e.amount, 0);
+  const topCategoryThisMonth = (() => {
+    const totals = {};
+    thisMonthExpenses.forEach((e) => { totals[e.category] = (totals[e.category] || 0) + e.amount; });
+    const sorted = Object.entries(totals).sort((a, b) => b[1] - a[1]);
+    return sorted[0]; // [category, amount] or undefined
+  })();
 
   return (
     <div style={styles.panel}>
@@ -5378,6 +5560,7 @@ function ExpensesPanel({ biz, category: bizCategory, persist, setTab, currentEmp
       <div style={styles.statGrid}>
         <StatCard label="Spent this month" value={currency(totalThisMonth)} />
         {bizCategory?.id !== "property" && <StatCard label="Damages / loss" value={currency(damagesThisMonth)} />}
+        {topCategoryThisMonth && <StatCard label="Biggest category" value={topCategoryThisMonth[0]} sub={currency(topCategoryThisMonth[1])} />}
       </div>
 
       {showForm && !isLocked && canEdit && (
@@ -5482,6 +5665,7 @@ function SuppliersPanel({ biz, category, persist, setTab }) {
   const [form, setForm] = useState({ name: "", phone: "", email: "", address: "", suppliesWhat: "" });
   const [expandedId, setExpandedId] = useState(null);
   const [query, setQuery] = useState("");
+  const [sortBy, setSortBy] = useState("recent"); // recent | top | az
 
   const suppliers = biz.suppliers || [];
   const restocks = biz.restocks || [];
@@ -5529,6 +5713,11 @@ function SuppliersPanel({ biz, category, persist, setTab }) {
   };
 
   const filtered = suppliers.filter((s) => s.name.toLowerCase().includes(query.toLowerCase()));
+  const sorted = [...filtered].sort((a, b) => {
+    if (sortBy === "az") return a.name.localeCompare(b.name);
+    if (sortBy === "top") return statsFor(b).totalSpent - statsFor(a).totalSpent;
+    return 0;
+  });
   const totalSpentAllSuppliers = suppliers.reduce((sum, s) => sum + statsFor(s).totalSpent, 0);
 
   return (
@@ -5570,8 +5759,17 @@ function SuppliersPanel({ biz, category, persist, setTab }) {
               <input style={styles.searchInput} placeholder="Search suppliers…" value={query} onChange={(e) => setQuery(e.target.value)} />
             </div>
           )}
+          {suppliers.length > 1 && (
+            <div style={{ display: "flex", gap: 8, marginBottom: 12 }}>
+              {[["recent", "Recent"], ["top", "Top spend"], ["az", "A–Z"]].map(([id, label]) => (
+                <button key={id} type="button"
+                  style={{ ...styles.paymentChip, flex: "none", ...(sortBy === id ? { background: "var(--accent)", color: "#fff", borderColor: "var(--accent)" } : {}) }}
+                  onClick={() => setSortBy(id)}>{label}</button>
+              ))}
+            </div>
+          )}
           <div style={styles.list}>
-            {filtered.map((s) => {
+            {sorted.map((s) => {
               const { totalSpent, lastRestock, restockCount } = statsFor(s);
               const isExpanded = expandedId === s.id;
               return (
@@ -5741,6 +5939,20 @@ function PurchaseOrdersPanel({ biz, category, persist, notify, setTab }) {
         )}
       </div>
       <p style={styles.helperText}>Send a formal order to a supplier before goods arrive, then mark it received to add the stock and log the cost in one step.</p>
+
+      {branchPOs.length > 0 && (() => {
+        const outstanding = branchPOs.filter((po) => po.status === "sent");
+        const outstandingValue = outstanding.reduce((s, po) => s + po.total, 0);
+        const now = new Date();
+        const receivedThisMonth = branchPOs.filter((po) => po.status === "received" && new Date(po.ts).getMonth() === now.getMonth() && new Date(po.ts).getFullYear() === now.getFullYear());
+        const receivedValue = receivedThisMonth.reduce((s, po) => s + po.total, 0);
+        return (
+          <div style={styles.statGrid}>
+            <StatCard label="Awaiting delivery" value={currency(outstandingValue)} sub={`${outstanding.length} order${outstanding.length !== 1 ? "s" : ""}`} />
+            <StatCard label="Received this month" value={currency(receivedValue)} />
+          </div>
+        );
+      })()}
 
       {suppliers.length === 0 ? (
         <Callout icon={Truck} tone="warn">
@@ -6211,6 +6423,19 @@ function CalendarPanel({ biz, category, persist, setTab }) {
     return orders.length ? "var(--accent)" : null;
   };
 
+  // Whole-month summary — gives an at-a-glance read on the month before scrolling
+  // through individual days.
+  const monthOrders = branchOrders.filter((o) => o.ts >= new Date(monthDate.getFullYear(), monthDate.getMonth(), 1).getTime()
+    && o.ts <= new Date(monthDate.getFullYear(), monthDate.getMonth() + 1, 0, 23, 59, 59, 999).getTime());
+  const monthRevenue = monthOrders.reduce((s, o) => s + (o.total || 0), 0);
+  const allDueThisMonth = isPropertyBiz
+    ? cells.filter(Boolean).flatMap((d) => propertiesDueOn(d))
+    : [];
+  const uniqueDueThisMonth = Array.from(new Map(allDueThisMonth.map((d) => [d.property.id, d])).values());
+  const paidCount = uniqueDueThisMonth.filter((d) => d.paid).length;
+
+  const jumpToToday = () => { setMonthDate(new Date()); setSelectedDate(new Date()); };
+
   return (
     <div style={styles.panel}>
       <SectionTitle title="Calendar" />
@@ -6220,6 +6445,29 @@ function CalendarPanel({ biz, category, persist, setTab }) {
           : `A day-by-day view of your ${category.orderNounPlural.toLowerCase()}.`}
       </p>
 
+      {isPropertyBiz ? (
+        uniqueDueThisMonth.length > 0 && (
+          <div className="lift-card" style={{ ...styles.trendCard, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+            <div>
+              <div style={styles.listRowTitle}>{paidCount} of {uniqueDueThisMonth.length} collected</div>
+              <div style={styles.listRowSub}>{monthDate.toLocaleDateString("default", { month: "long", year: "numeric" })}</div>
+            </div>
+            <div style={{ fontSize: 22, fontWeight: 700, color: paidCount === uniqueDueThisMonth.length ? "#22A06B" : "#B23A2E" }}>
+              {Math.round((paidCount / uniqueDueThisMonth.length) * 100)}%
+            </div>
+          </div>
+        )
+      ) : (
+        monthOrders.length > 0 && (
+          <div className="lift-card" style={{ ...styles.trendCard, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+            <div>
+              <div style={styles.listRowTitle}>{currency(monthRevenue)}</div>
+              <div style={styles.listRowSub}>{monthOrders.length} {category.orderNounPlural.toLowerCase()} · {monthDate.toLocaleDateString("default", { month: "long", year: "numeric" })}</div>
+            </div>
+          </div>
+        )
+      )}
+
       <div style={styles.dateNavRow}>
         <button style={styles.dateNavArrow} onClick={() => shiftMonth(-1)}>‹</button>
         <div style={styles.dateNavCenter}>
@@ -6227,6 +6475,9 @@ function CalendarPanel({ biz, category, persist, setTab }) {
         </div>
         <button style={styles.dateNavArrow} onClick={() => shiftMonth(1)}>›</button>
       </div>
+      {!isCurrentMonth && (
+        <button style={{ ...styles.calloutLink, color: "var(--accent)", marginBottom: 10 }} onClick={jumpToToday}>Jump to today</button>
+      )}
 
       <div style={cs.weekHeader}>
         {WEEKDAY_LABELS.map((w) => <div key={w} style={cs.weekHeaderCell}>{w}</div>)}
@@ -6249,6 +6500,18 @@ function CalendarPanel({ biz, category, persist, setTab }) {
             </button>
           );
         })}
+      </div>
+
+      <div style={{ display: "flex", gap: 14, flexWrap: "wrap", marginBottom: 18, marginTop: -10 }}>
+        {isPropertyBiz ? (
+          <>
+            <span style={{ display: "flex", alignItems: "center", gap: 5, fontSize: 12, color: "var(--ink-faint)" }}><span style={{ width: 7, height: 7, borderRadius: "50%", background: "#22A06B" }} /> Paid</span>
+            <span style={{ display: "flex", alignItems: "center", gap: 5, fontSize: 12, color: "var(--ink-faint)" }}><span style={{ width: 7, height: 7, borderRadius: "50%", background: "#B23A2E" }} /> Due</span>
+          </>
+        ) : (
+          <span style={{ display: "flex", alignItems: "center", gap: 5, fontSize: 12, color: "var(--ink-faint)" }}><span style={{ width: 7, height: 7, borderRadius: "50%", background: "var(--accent)" }} /> {category.orderNounPlural}</span>
+        )}
+        <span style={{ display: "flex", alignItems: "center", gap: 5, fontSize: 12, color: "var(--ink-faint)" }}><span style={{ width: 7, height: 7, borderRadius: "50%", background: "#B8862F" }} /> Note</span>
       </div>
 
       <SectionTitle title={selectedDate.toLocaleDateString("default", { weekday: "long", month: "short", day: "numeric" })} small />
@@ -6291,7 +6554,8 @@ function CalendarPanel({ biz, category, persist, setTab }) {
 
       {isServiceBiz && (
         <p style={{ ...styles.helperText, marginTop: 12 }}>
-          To schedule a future {category.orderNoun.toLowerCase()}, create it from the {category.orderNounPlural} tab and set its date ahead — it'll appear here on that day.
+          To schedule a future {category.orderNoun.toLowerCase()}, create it from the {category.orderNounPlural} tab and set its date ahead — it'll appear here on that day, and a reminder to confirm it will show up in{" "}
+          <button style={{ ...styles.calloutLink, display: "inline", color: "var(--accent)", padding: 0 }} onClick={() => setTab("reminders")}>Reminders</button> the day before.
         </p>
       )}
 
@@ -6974,17 +7238,9 @@ function AccountingPanel({ biz, category, persist, setTab }) {
     });
   };
 
-  // Sends a friendly payment reminder through the phone's own share sheet (WhatsApp, SMS,
-  // whatever the person picks) — same mechanism already used for receipts and customer notes.
-  const remindCustomer = (order) => {
-    const lines = [
-      `Hi ${order.customerName || "there"}, this is ${biz.profile.name}.`,
-      `Friendly reminder: you have an outstanding balance of ${currency(order.total)} from ${new Date(order.ts).toLocaleDateString()}.`,
-      `Kindly settle at your earliest convenience — thank you!`,
-    ];
-    shareText(`Payment reminder — ${order.customerName || "Customer"}`, lines.join("\n"));
-    persist({ ...biz, orders: biz.orders.map((o) => o.id === order.id ? { ...o, lastReminderAt: Date.now() } : o) });
-  };
+  // Payment reminders now live in the Reminders tab (proper WhatsApp/SMS click-to-chat,
+  // with per-message editing and sent-tracking) — this panel links there instead of
+  // duplicating a lesser version of the same thing.
 
   const ledger = [
     ...branchOrdersAll.filter((o) => o.paymentStatus !== "credit").map((o) => ({ id: o.id, ts: o.ts, label: o.customerName || "Walk-in sale", amount: o.total })),
@@ -7056,24 +7312,23 @@ function AccountingPanel({ biz, category, persist, setTab }) {
       {creditOrders.length === 0 ? (
         <EmptyState text="No credit sales outstanding. Select 'On credit' as the payment method on a sale to track it here." icon={HandCoins} />
       ) : (
-        <div style={styles.list}>
-          {creditOrders.map((o) => (
-            <div key={o.id} style={styles.listRow}>
-              <div>
-                <div style={styles.listRowTitle}>{o.customerName || "Walk-in"}</div>
-                <div style={styles.listRowSub}>
-                  {new Date(o.ts).toLocaleDateString()}
-                  {o.lastReminderAt ? ` · Reminded ${new Date(o.lastReminderAt).toLocaleDateString()}` : ""}
+        <>
+          <p style={styles.helperText}>Want to send reminders? <button style={styles.textLinkBtn} onClick={() => setTab("reminders")}>Open Reminders</button> for a ready-to-send WhatsApp/SMS message per customer.</p>
+          <div style={styles.list}>
+            {creditOrders.map((o) => (
+              <div key={o.id} style={styles.listRow}>
+                <div>
+                  <div style={styles.listRowTitle}>{o.customerName || "Walk-in"}</div>
+                  <div style={styles.listRowSub}>{new Date(o.ts).toLocaleDateString()}</div>
+                </div>
+                <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                  <span style={styles.mono}>{currency(o.total)}</span>
+                  <button style={styles.smallAddBtn} onClick={() => settleOrder(o.id)}>Mark paid</button>
                 </div>
               </div>
-              <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                <span style={styles.mono}>{currency(o.total)}</span>
-                <button style={styles.iconBtn} title="Send payment reminder" onClick={() => remindCustomer(o)}><MessageCircle size={15} /></button>
-                <button style={styles.smallAddBtn} onClick={() => settleOrder(o.id)}>Mark paid</button>
-              </div>
-            </div>
-          ))}
-        </div>
+            ))}
+          </div>
+        </>
       )}
 
       <SectionTitle title="Balance sheet snapshot" small />
@@ -7525,25 +7780,49 @@ function BudgetPanel({ biz, persist, notify, setTab }) {
       {budgets.length === 0 ? (
         <EmptyState text="Create a budget above — personal, family, whatever you like — and start tracking planned vs actual spending." icon={PiggyBank} />
       ) : (
-        <div style={styles.list}>
-          {budgets.map((b) => {
-            const { totalPlanned, totalSpent } = budgetTotals(b, now);
-            const pct = totalPlanned > 0 ? Math.min(100, Math.round((totalSpent / totalPlanned) * 100)) : 0;
-            const over = totalPlanned > 0 && totalSpent > totalPlanned;
+        <>
+          {(() => {
+            const totals = budgets.reduce((acc, b) => {
+              const { totalPlanned, totalSpent } = budgetTotals(b, now);
+              return { planned: acc.planned + totalPlanned, spent: acc.spent + totalSpent };
+            }, { planned: 0, spent: 0 });
+            if (totals.planned === 0) return null;
+            const remaining = totals.planned - totals.spent;
             return (
-              <button key={b.id} className="lift-card" style={styles.listRowClickable} onClick={() => setSelectedId(b.id)}>
-                <div style={{ flex: 1 }}>
-                  <div style={styles.listRowTitle}>{b.name}</div>
-                  <div style={styles.listRowSub}>{b.categories.length} categor{b.categories.length !== 1 ? "ies" : "y"} · {currency(totalSpent)} of {currency(totalPlanned)} this month</div>
-                  <div style={{ height: 6, background: "var(--bg)", borderRadius: 4, marginTop: 8, overflow: "hidden" }}>
-                    <div style={{ height: "100%", width: `${pct}%`, background: over ? "#B23A2E" : "var(--accent)", borderRadius: 4 }} />
-                  </div>
+              <div className="lift-card" style={{ ...styles.trendCard, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                <div>
+                  <div style={styles.listRowTitle}>{currency(totals.spent)} spent this month</div>
+                  <div style={styles.listRowSub}>of {currency(totals.planned)} planned, across {budgets.length} budget{budgets.length !== 1 ? "s" : ""}</div>
                 </div>
-                <ChevronRight size={16} color="var(--ink-faint)" />
-              </button>
+                <div style={{ fontSize: 20, fontWeight: 700, color: remaining < 0 ? "#B23A2E" : "#22A06B" }}>
+                  {remaining < 0 ? `${currency(Math.abs(remaining))} over` : `${currency(remaining)} left`}
+                </div>
+              </div>
             );
-          })}
-        </div>
+          })()}
+          <div style={styles.list}>
+            {budgets.map((b) => {
+              const { totalPlanned, totalSpent } = budgetTotals(b, now);
+              const pct = totalPlanned > 0 ? Math.min(100, Math.round((totalSpent / totalPlanned) * 100)) : 0;
+              const over = totalPlanned > 0 && totalSpent > totalPlanned;
+              return (
+                <button key={b.id} className="lift-card" style={styles.listRowClickable} onClick={() => setSelectedId(b.id)}>
+                  <div style={{ flex: 1 }}>
+                    <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                      <div style={styles.listRowTitle}>{b.name}</div>
+                      {over && <span style={{ ...styles.badge, background: "rgba(178,58,46,0.12)", color: "#B23A2E" }}>Over</span>}
+                    </div>
+                    <div style={styles.listRowSub}>{b.categories.length} categor{b.categories.length !== 1 ? "ies" : "y"} · {currency(totalSpent)} of {currency(totalPlanned)} this month</div>
+                    <div style={{ height: 6, background: "var(--bg)", borderRadius: 4, marginTop: 8, overflow: "hidden" }}>
+                      <div style={{ height: "100%", width: `${pct}%`, background: over ? "#B23A2E" : "var(--accent)", borderRadius: 4 }} />
+                    </div>
+                  </div>
+                  <ChevronRight size={16} color="var(--ink-faint)" />
+                </button>
+              );
+            })}
+          </div>
+        </>
       )}
     </div>
   );
@@ -7765,13 +8044,25 @@ function AlertsPanel({ biz, persist }) {
   const markAllRead = () => {
     persist({ ...biz, notifications: biz.notifications.map((n) => ({ ...n, read: true })) });
   };
+  const clearAll = () => {
+    if (!window.confirm("Clear all alerts? This can't be undone.")) return;
+    persist({ ...biz, notifications: [] });
+  };
+  const dismiss = (id) => {
+    persist({ ...biz, notifications: biz.notifications.filter((n) => n.id !== id) });
+  };
   return (
     <div style={styles.panel}>
       <div style={styles.panelHeader}>
         <SectionTitle title="Alerts" />
-        {biz.notifications.some((n) => !n.read) && (
-          <button style={styles.textLinkBtn} onClick={markAllRead}>Mark all read</button>
-        )}
+        <div style={{ display: "flex", gap: 12 }}>
+          {biz.notifications.some((n) => !n.read) && (
+            <button style={styles.textLinkBtn} onClick={markAllRead}>Mark all read</button>
+          )}
+          {biz.notifications.length > 0 && (
+            <button style={{ ...styles.textLinkBtn, color: "#B23A2E" }} onClick={clearAll}>Clear all</button>
+          )}
+        </div>
       </div>
       {biz.notifications.length === 0 ? (
         <EmptyState text="You'll see payment confirmations and stock alerts here as they happen." icon={Bell} />
@@ -7780,10 +8071,11 @@ function AlertsPanel({ biz, persist }) {
           {biz.notifications.map((n) => (
             <div key={n.id} style={{ ...styles.listRow, opacity: n.read ? 0.55 : 1 }}>
               <Bell size={15} color="var(--accent)" style={{ marginTop: 2 }} />
-              <div style={{ marginLeft: 10 }}>
+              <div style={{ marginLeft: 10, flex: 1 }}>
                 <div style={styles.listRowTitle}>{n.message}</div>
                 <div style={styles.listRowSub}>{new Date(n.ts).toLocaleString()}</div>
               </div>
+              <button style={styles.iconBtn} title="Dismiss" onClick={() => dismiss(n.id)}><X size={14} /></button>
             </div>
           ))}
         </div>
@@ -7793,7 +8085,8 @@ function AlertsPanel({ biz, persist }) {
 }
 
 /* =========================================================
-   MARKETING (placeholder — needs external services)
+   MARKETING — AI-assisted flyers and post ideas, built from your
+   own items, logo, and brand color.
    ========================================================= */
 function MarketingPanel({ biz, category, setTab }) {
   const branding = biz.profile.branding || {};
@@ -8116,6 +8409,7 @@ function DocumentsPanel({ biz, category, persist, setTab, canEditBranding = true
   const [showBranding, setShowBranding] = useState(false);
   const [signatureMode, setSignatureMode] = useState("draw");
   const [colorHint, setColorHint] = useState(null);
+  const [docSearch, setDocSearch] = useState("");
 
   const branding = biz.profile.branding || {};
   const [address, setAddress] = useState(branding.address || "");
@@ -8352,15 +8646,23 @@ function DocumentsPanel({ biz, category, persist, setTab, canEditBranding = true
       {biz.documents.length > 0 && (
         <>
           <SectionTitle title="Previously generated" small />
+          {biz.documents.length > 4 && (
+            <div style={styles.searchWrap}>
+              <SearchIcon size={15} color="var(--ink-faint)" />
+              <input style={styles.searchInput} placeholder="Search by name…" value={docSearch} onChange={(e) => setDocSearch(e.target.value)} />
+            </div>
+          )}
           <div style={styles.list}>
-            {biz.documents.map((d) => (
-              <button key={d.id} className="lift-card" style={styles.listRowClickable} onClick={() => setPreview(d)}>
-                <div>
+            {biz.documents.filter((d) => !docSearch.trim() || d.personName.toLowerCase().includes(docSearch.trim().toLowerCase()) || d.templateLabel.toLowerCase().includes(docSearch.trim().toLowerCase())).map((d) => (
+              <div key={d.id} style={styles.listRow}>
+                <button type="button" style={{ all: "unset", cursor: "pointer", flex: 1 }} onClick={() => setPreview(d)}>
                   <div style={styles.listRowTitle}>{d.templateLabel}</div>
                   <div style={styles.listRowSub}>{d.personName} · {new Date(d.ts).toLocaleDateString()}</div>
-                </div>
-                <ChevronRight size={16} color="var(--ink-faint)" />
-              </button>
+                </button>
+                <button style={styles.iconBtn} title="Delete" onClick={() => { if (window.confirm("Delete this document? This can't be undone.")) persist({ ...biz, documents: biz.documents.filter((x) => x.id !== d.id) }); }}>
+                  <Trash2 size={15} />
+                </button>
+              </div>
             ))}
           </div>
         </>
@@ -8695,7 +8997,9 @@ function SettingsPanel({ biz, category, persist, setTab, onLogout, account }) {
           Plan: {tierOf(biz).name}
           {biz.profile.tier === "starter" && biz.profile.accountingAddon ? " + Accounting" : ""}
           {" — "}{tierOf(biz).seatLimit === Infinity ? "unlimited" : tierOf(biz).seatLimit} staff seat{tierOf(biz).seatLimit !== 1 ? "s" : ""}, {tierOf(biz).branchLimit === Infinity ? "unlimited" : tierOf(biz).branchLimit} branch{tierOf(biz).branchLimit !== 1 ? "es" : ""}
+          {tierOf(biz).prioritySupport ? " — priority support included" : ""}
         </div>
+        <button style={{ ...styles.calloutLink, color: "var(--accent)", marginTop: 6 }} onClick={() => setTab("terms")}>Terms & Privacy</button>
         <button style={styles.logoutBtn} onClick={onLogout}><LogOut size={15} /> Log out</button>
       </div>
 
