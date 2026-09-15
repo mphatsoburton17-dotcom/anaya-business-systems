@@ -1292,6 +1292,21 @@ export default function App() {
     return <AuthGate onRegister={handleRegister} onLogin={handleLogin} onEnter={handleEnter} />;
   }
 
+  if (biz.profile.suspended) {
+    return (
+      <div style={{ minHeight: "100vh", display: "flex", alignItems: "center", justifyContent: "center", background: "var(--bg)", padding: 24 }}>
+        <div style={{ maxWidth: 380, textAlign: "center" }}>
+          <div style={{ fontSize: 40, marginBottom: 12 }}>⏸️</div>
+          <h2 style={{ margin: "0 0 8px 0", color: "var(--ink)" }}>This account is on hold</h2>
+          <p style={{ color: "var(--ink-soft)", fontSize: 14.5, lineHeight: 1.6 }}>
+            Access to {biz.profile.name} has been paused. If you believe this is a mistake or have a question about your account, please get in touch with support.
+          </p>
+          <button style={{ ...styles.logoutBtn, marginTop: 16 }} onClick={handleLogout}><LogOut size={15} /> Log out</button>
+        </div>
+      </div>
+    );
+  }
+
   const category = CATEGORIES.find((c) => c.id === biz.profile.categoryId) || CATEGORIES[0];
   const currentEmployee = biz.employees.find((e) => e.id === session) || biz.employees[0];
   const isOwner = currentEmployee?.role === "owner";
