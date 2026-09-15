@@ -334,34 +334,40 @@ const SEAT_LIMITS = { solo: 1, small: 4, medium: 10, large: 999 }; // legacy —
 const TRIAL_DAYS = 7;
 const TIERS = {
   starter: {
-    id: "starter", name: "Starter", price: 20000,
+    id: "starter", name: "Starter", price: 20000, billingPeriodMonths: 1,
     branchLimit: 1, seatLimit: 1,
     hasAccounting: false, hasGrowth: false, hasHR: false, hasBranchMgmt: false,
     freeExtraBusinesses: 0, prioritySupport: false,
     desc: "Sales, items, customers, quotes, calendar, and receipts — everything to run daily sales.",
   },
   growth: {
-    id: "growth", name: "Growth", price: 35000,
+    id: "growth", name: "Growth", price: 35000, billingPeriodMonths: 1,
     branchLimit: 2, seatLimit: 2,
     hasAccounting: true, hasGrowth: true, hasHR: true, hasBranchMgmt: false,
     freeExtraBusinesses: 0, prioritySupport: false,
     desc: "Everything in Starter, plus Expenses, Suppliers, Purchase Orders, Reports, Accounting, Documents, and Staff & HR. Up to 2 branches and 2 staff logins.",
   },
   pro: {
-    id: "pro", name: "Pro", price: 50000, price3Month: 100000,
+    id: "pro", name: "Pro", price: 50000, billingPeriodMonths: 1,
     branchLimit: Infinity, seatLimit: Infinity,
     hasAccounting: true, hasGrowth: true, hasHR: true, hasBranchMgmt: true,
     freeExtraBusinesses: 1, prioritySupport: false,
     desc: "Everything in Growth, plus unlimited branches and staff logins, full Branches management, and one additional business included free.",
   },
   max: {
-    id: "max", name: "Max", price: 100000,
+    // A standalone 3-month plan, not a bundled multiple of any other tier's monthly
+    // price — billed once per quarter rather than monthly.
+    id: "max", name: "Max", price: 100000, billingPeriodMonths: 3,
     branchLimit: Infinity, seatLimit: Infinity,
     hasAccounting: true, hasGrowth: true, hasHR: true, hasBranchMgmt: true,
     freeExtraBusinesses: 3, prioritySupport: true,
-    desc: "Everything in Pro, plus 3 additional businesses included free and priority support — for owners running several businesses at once.",
+    desc: "Everything in Pro, plus 3 additional businesses included free and priority support — billed once every 3 months, for owners running several businesses at once.",
   },
 };
+// Small helper so every price label reads consistently wherever a tier is shown.
+function tierPriceLabel(t) {
+  return t.billingPeriodMonths === 1 ? `${currency(t.price)}/month` : `${currency(t.price)} / ${t.billingPeriodMonths} months`;
+}
 const ACCOUNTING_ADDON_PRICE = 10000; // MWK / month — lets a Starter plan add just Accounting, without upgrading to Growth
 function tierOf(biz) {
   return TIERS[biz?.profile?.tier] || TIERS.starter;
@@ -1166,11 +1172,11 @@ export default function App() {
           alert(`"${pendingRecord.name}" has been created and is ready to set up.`);
         }
       } else if (succeeded && pendingRecord?.type === "billing") {
-        // A paid plan runs for a fixed period from the moment payment clears — a month,
-        // or 3 months for Pro's quarterly option — after which the renewal reminder
-        // email (sent by the send-subscription-emails function) kicks in.
+        // A paid plan runs for a fixed period from the moment payment clears — a month
+        // for most tiers, 3 months for Max (which is billed quarterly, not monthly) —
+        // after which the renewal reminder email (sent by send-subscription-emails) kicks in.
         const req = pendingRecord.requested;
-        const durationDays = req.tier === "pro" && req.proDuration === "3month" ? 90 : 30;
+        const durationDays = (TIERS[req.tier]?.billingPeriodMonths || 1) * 30;
         const newExpiresAt = Date.now() + durationDays * 86400000;
         setBiz((current) => {
           if (!current) return current;
@@ -1391,6 +1397,9 @@ export default function App() {
         )}
         {tab === "alerts" && (
           <AlertsPanel biz={biz} persist={persist} />
+        )}
+        {tab === "marketing" && (
+          <MarketingPanel biz={biz} category={category} setTab={setTab} />
         )}
         {tab === "documents" && (isOwner || isManager || hasModuleAccess(currentEmployee, "marketing")) && (
           hasGrowthFeatures(biz)
@@ -1737,15 +1746,14 @@ function LandingPage({ onGetStarted, onLogin, onShowTerms }) {
           <Reveal>
             <div style={s.sectionLabel}>Simple pricing</div>
             <h2 style={s.h2}>Pick the plan that fits your business.</h2>
-            <p style={s.sectionLead}>Three flat monthly plans, each unlocking more of the app. Every plan starts with a free 7-day trial, every tool unlocked.</p>
+            <p style={s.sectionLead}>Four plans, each unlocking more of the app. Every plan starts with a free 7-day trial, every tool unlocked.</p>
           </Reveal>
 
-          <div className="lp-two-col" style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 20, marginBottom: 20 }}>
+          <div className="lp-two-col" style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(200px, 1fr))", gap: 20, marginBottom: 20 }}>
             {Object.values(TIERS).map((t, i) => (
               <Reveal key={t.id} delay={i * 100}>
                 <div style={{ ...s.card, ...(t.id === "growth" ? { borderColor: BRAND.accent, borderWidth: 2 } : {}) }}>
-                  <div style={s.featureTitle}>{t.name} — {currency(t.price)}/month</div>
-                  {t.price3Month && <div style={{ fontSize: 13, color: BRAND.accent, fontWeight: 700, marginBottom: 8 }}>or {currency(t.price3Month)} for 3 months</div>}
+                  <div style={s.featureTitle}>{t.name} — {tierPriceLabel(t)}</div>
                   <div style={s.featureDesc}>{t.desc}</div>
                   <div style={{ fontSize: 13, color: BRAND.inkFaint, marginTop: 10, fontWeight: 600 }}>
                     {t.branchLimit === Infinity ? "Unlimited" : t.branchLimit} branch{t.branchLimit !== 1 ? "es" : ""} · {t.seatLimit === Infinity ? "unlimited" : t.seatLimit} staff login{t.seatLimit !== 1 ? "s" : ""}
@@ -2475,7 +2483,7 @@ function Onboarding({ onCreate }) {
                     background: active ? "var(--accent-soft, #E3EFE7)" : "var(--surface)",
                   }}
                 >
-                  <div>{t.name} — {currency(t.price)}/month{t.price3Month ? ` (or ${currency(t.price3Month)} for 3 months)` : ""}</div>
+                  <div>{t.name} — {tierPriceLabel(t)}</div>
                   <div style={{ fontSize: 12.5, fontWeight: 400, color: "var(--ink-faint)", marginTop: 4, lineHeight: 1.4 }}>{t.desc}</div>
                 </button>
               );
@@ -3457,6 +3465,7 @@ function ItemsPanel({ biz, category, persist, notify, isOwner }) {
   const [newTag, setNewTag] = useState("");
   const [restockingId, setRestockingId] = useState(null); // item id currently showing the restock form
   const [restockForm, setRestockForm] = useState({ qty: "", costPerUnit: "", supplierId: "", supplier: "", logExpense: true });
+  const [sortBy, setSortBy] = useState("recent"); // recent | low-stock | az | price
   const bizCategories = biz.categories || [];
   const suppliers = biz.suppliers || [];
 
@@ -3672,17 +3681,42 @@ function ItemsPanel({ biz, category, persist, notify, isOwner }) {
 
       {itemsForBranch(biz.items, biz.settings?.activeBranchId).length === 0 ? (
         <EmptyState text={`No ${category.itemLabelPlural.toLowerCase()} yet. Add your first one above.`} icon={category.icon} />
-      ) : (
-        <>
-          {itemsForBranch(biz.items, biz.settings?.activeBranchId).length > 4 && (
-            <div style={styles.searchWrap}>
-              <SearchIcon size={15} color="var(--ink-faint)" />
-              <input style={styles.searchInput} placeholder={`Search ${category.itemLabelPlural.toLowerCase()}…`}
-                value={query} onChange={(e) => setQuery(e.target.value)} />
-            </div>
-          )}
-          <div style={styles.list}>
-          {itemsForBranch(biz.items, biz.settings?.activeBranchId).filter((i) => i.name.toLowerCase().includes(query.toLowerCase())).map((item) => (
+      ) : (() => {
+        const branchItems = itemsForBranch(biz.items, biz.settings?.activeBranchId);
+        const lowStockCount = category.hasStock ? branchItems.filter((i) => i.stock !== undefined && i.stock <= i.lowStockAt).length : 0;
+        const inventoryValue = category.hasStock ? branchItems.reduce((s, i) => s + (i.cost || 0) * (i.stock || 0), 0) : 0;
+        const sorted = branchItems.filter((i) => i.name.toLowerCase().includes(query.toLowerCase())).sort((a, b) => {
+          if (sortBy === "az") return a.name.localeCompare(b.name);
+          if (sortBy === "price") return b.price - a.price;
+          if (sortBy === "low-stock") return (a.stock ?? Infinity) - (b.stock ?? Infinity);
+          return 0;
+        });
+        return (
+          <>
+            {category.hasStock && (
+              <div style={styles.statGrid}>
+                <StatCard label="Inventory value" value={currency(inventoryValue)} />
+                <StatCard label="Low stock" value={lowStockCount} />
+              </div>
+            )}
+            {branchItems.length > 4 && (
+              <div style={styles.searchWrap}>
+                <SearchIcon size={15} color="var(--ink-faint)" />
+                <input style={styles.searchInput} placeholder={`Search ${category.itemLabelPlural.toLowerCase()}…`}
+                  value={query} onChange={(e) => setQuery(e.target.value)} />
+              </div>
+            )}
+            {branchItems.length > 1 && (
+              <div style={{ display: "flex", gap: 8, marginBottom: 12, flexWrap: "wrap" }}>
+                {[["recent", "Recent"], ...(category.hasStock ? [["low-stock", "Low stock first"]] : []), ["price", "Highest price"], ["az", "A–Z"]].map(([id, label]) => (
+                  <button key={id} type="button"
+                    style={{ ...styles.paymentChip, flex: "none", ...(sortBy === id ? { background: "var(--accent)", color: "#fff", borderColor: "var(--accent)" } : {}) }}
+                    onClick={() => setSortBy(id)}>{label}</button>
+                ))}
+              </div>
+            )}
+            <div style={styles.list}>
+          {sorted.map((item) => (
             <div key={item.id}>
               <div style={styles.listRow}>
                 <div>
@@ -3787,7 +3821,8 @@ function ItemsPanel({ biz, category, persist, notify, isOwner }) {
           ))}
         </div>
         </>
-      )}
+        );
+      })()}
 
       {recentRestocks.length > 0 && (
         <>
@@ -3865,6 +3900,8 @@ function OrdersPanel({ biz, category, persist, notify, currentEmployee }) {
   const quickTotal = Math.round(Number(quickAmount) || 0);
 
   const branchOrders = filterByBranch(biz.orders, biz.settings?.activeBranchId).slice().sort((a, b) => b.ts - a.ts);
+  const todaysOrders = branchOrders.filter((o) => isSameDay(o.ts, new Date()));
+  const todaysTotal = todaysOrders.reduce((s, o) => s + o.total, 0);
 
   const resetForm = () => {
     setCart([]);
@@ -4032,6 +4069,15 @@ function OrdersPanel({ biz, category, persist, notify, currentEmployee }) {
           {editingOrderId ? <><X size={16} /> Cancel edit</> : <><Plus size={16} /> {category.quickLabels.newOrder}</>}
         </button>
       </div>
+
+      {todaysOrders.length > 0 && (
+        <div className="lift-card" style={{ ...styles.trendCard, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+          <div>
+            <div style={styles.listRowTitle}>{currency(todaysTotal)} today</div>
+            <div style={styles.listRowSub}>{todaysOrders.length} {category.orderNounPlural.toLowerCase()}</div>
+          </div>
+        </div>
+      )}
 
       {showForm && (
         <div style={styles.formCard}>
@@ -7396,18 +7442,14 @@ function BillingPanel({ biz, persist, setTab }) {
   const [showRequestForm, setShowRequestForm] = useState(false);
   const [reqTierId, setReqTierId] = useState(currentTierId);
   const [reqAddon, setReqAddon] = useState(currentAddonActive);
-  const [reqProDuration, setReqProDuration] = useState("month"); // month | 3month — only matters for Pro
 
   const reqTier = TIERS[reqTierId];
-  const requestedTotal = reqTierId === "pro" && reqProDuration === "3month"
-    ? reqTier.price3Month
-    : reqTier.price + (reqTierId === "starter" && reqAddon ? ACCOUNTING_ADDON_PRICE : 0);
-  const hasChange = reqTierId !== currentTierId || (reqTierId === "starter" && reqAddon !== currentAddonActive) || (reqTierId === "pro" && reqProDuration === "3month");
+  const requestedTotal = reqTier.price + (reqTierId === "starter" && reqAddon ? ACCOUNTING_ADDON_PRICE : 0);
+  const hasChange = reqTierId !== currentTierId || (reqTierId === "starter" && reqAddon !== currentAddonActive);
 
   const openRequestForm = () => {
     setReqTierId(currentTierId);
     setReqAddon(currentAddonActive);
-    setReqProDuration("month");
     setShowRequestForm(true);
   };
 
@@ -7419,14 +7461,14 @@ function BillingPanel({ biz, persist, setTab }) {
   const willLockStaff = reqTier.seatLimit < staffInUse ? staffInUse - reqTier.seatLimit : 0;
   const payWithPayChangu = async () => {
     setPayingViaPayChangu(true);
-    const description = `Plan — ${reqTier.name}${reqTierId === "pro" && reqProDuration === "3month" ? " (3 months)" : "/month"}${reqTierId === "starter" && reqAddon ? " + Accounting add-on" : ""}`;
+    const description = `Plan — ${reqTier.name}${reqTier.billingPeriodMonths === 1 ? "/month" : ` (${reqTier.billingPeriodMonths} months)`}${reqTierId === "starter" && reqAddon ? " + Accounting add-on" : ""}`;
     const result = await startPayChanguCheckout({
       amount: requestedTotal,
       businessName: biz.profile.name,
       description,
       pendingRecord: {
         type: "billing",
-        requested: { tier: reqTierId, accountingAddon: reqTierId === "starter" ? reqAddon : false, proDuration: reqTierId === "pro" ? reqProDuration : "month" },
+        requested: { tier: reqTierId, accountingAddon: reqTierId === "starter" ? reqAddon : false },
         total: requestedTotal,
       },
     });
@@ -7442,7 +7484,7 @@ function BillingPanel({ biz, persist, setTab }) {
 
       <SectionTitle title="Your current plan" small />
       <div style={styles.formCard}>
-        <div style={styles.listRowTitle}>{currentTier.name} — {currency(currentTotal)}/month</div>
+        <div style={styles.listRowTitle}>{currentTier.name} — {tierPriceLabel({ ...currentTier, price: currentTotal })}</div>
         <div style={styles.listRowSub}>
           {currentTier.branchLimit === Infinity ? "Unlimited" : currentTier.branchLimit} branch{currentTier.branchLimit !== 1 ? "es" : ""} · {currentTier.seatLimit === Infinity ? "unlimited" : currentTier.seatLimit} staff login{currentTier.seatLimit !== 1 ? "s" : ""}
           {currentAddonActive ? " · Accounting add-on" : ""}
@@ -7483,7 +7525,7 @@ function BillingPanel({ biz, persist, setTab }) {
                     background: active ? "var(--accent-soft, #E3EFE7)" : "var(--surface)",
                   }}
                 >
-                  <div>{t.name} — {currency(t.price)}/month{t.price3Month ? ` (or ${currency(t.price3Month)}/3 months)` : ""}{t.id === currentTierId ? " · Current plan" : ""}</div>
+                  <div>{t.name} — {tierPriceLabel(t)}{t.id === currentTierId ? " · Current plan" : ""}</div>
                   <div style={{ fontSize: 12.5, fontWeight: 400, color: "var(--ink-faint)", marginTop: 4, lineHeight: 1.4 }}>{t.desc}</div>
                 </button>
               );
@@ -7500,22 +7542,8 @@ function BillingPanel({ biz, persist, setTab }) {
             </label>
           )}
 
-          {reqTierId === "pro" && (
-            <>
-              <div style={{ ...styles.staffFormSectionLabel, marginTop: 12 }}>Billing period</div>
-              <div style={styles.paymentMethodRow}>
-                <button style={{ ...styles.paymentChip, ...(reqProDuration === "month" ? styles.paymentChipActive : {}) }} onClick={() => setReqProDuration("month")}>
-                  {currency(TIERS.pro.price)}/month
-                </button>
-                <button style={{ ...styles.paymentChip, ...(reqProDuration === "3month" ? styles.paymentChipActive : {}) }} onClick={() => setReqProDuration("3month")}>
-                  {currency(TIERS.pro.price3Month)}/3 months
-                </button>
-              </div>
-            </>
-          )}
-
           <div style={{ ...styles.formCard, marginTop: 12 }}>
-            <div style={styles.listRowTitle}>New total: {currency(requestedTotal)}{reqTierId === "pro" && reqProDuration === "3month" ? " for 3 months" : "/month"}</div>
+            <div style={styles.listRowTitle}>New total: {tierPriceLabel({ ...reqTier, price: requestedTotal })}</div>
             {!hasChange && <div style={styles.listRowSub}>This matches what you already have.</div>}
           </div>
 
@@ -7571,8 +7599,8 @@ function BusinessesPanel({ myBusinesses, biz, switchBusiness, switchingBusiness,
   const [newCategoryId, setNewCategoryId] = useState(CATEGORIES[0].id);
   const [creating, setCreating] = useState(false);
 
-  // Pro includes 1 additional business free (2 total under one login) — everyone else,
-  // and any business beyond that free one, pays the standalone monthly price.
+  // Pro includes 1 additional business free, Max includes 3 — everyone else,
+  // and any business beyond that free allowance, pays the standalone monthly price.
   const freeAllowance = freeExtraBusinessesFor(biz);
   const extraBusinessesSoFar = Math.max(0, myBusinesses.length - 1);
   const nextOneIsFree = extraBusinessesSoFar < freeAllowance;
@@ -7603,7 +7631,7 @@ function BusinessesPanel({ myBusinesses, biz, switchBusiness, switchingBusiness,
       <SectionTitle title="Businesses" />
       <p style={styles.helperText}>
         Every business under this login.{nextOneIsFree
-          ? " Your Pro plan includes one additional business free — add it below."
+          ? ` Your ${tierOf(biz).name} plan includes ${freeAllowance > 1 ? `${freeAllowance} additional businesses` : "one additional business"} free — add it below.`
           : ` Add another for ${currency(ADDITIONAL_BUSINESS_PRICE)}/month.`}
       </p>
 
@@ -7636,7 +7664,7 @@ function BusinessesPanel({ myBusinesses, biz, switchBusiness, switchingBusiness,
         <div style={{ ...styles.formCard, marginTop: 16 }}>
           <p style={styles.helperText}>
             A new business, fully separate from your others — its own items, sales, staff, and branches.{" "}
-            {nextOneIsFree ? "Included free on your Pro plan." : `${currency(ADDITIONAL_BUSINESS_PRICE)}/month, paid via PayChangu.`}
+            {nextOneIsFree ? `Included free on your ${tierOf(biz).name} plan.` : `${currency(ADDITIONAL_BUSINESS_PRICE)}/month, paid via PayChangu.`}
           </p>
           <input style={styles.textInput} placeholder="Business name" value={newName} onChange={(e) => setNewName(e.target.value)} />
           <select style={styles.textInput} value={newCategoryId} onChange={(e) => setNewCategoryId(e.target.value)}>
@@ -8769,7 +8797,7 @@ function SignaturePad({ onSave }) {
 function IntegrationsPanel({ setTab }) {
   const options = [
     { name: "Mobile money (Airtel Money / TNM Mpamba)", desc: "Auto-confirm payments instead of marking sales paid manually.", icon: Wallet },
-    { name: "WhatsApp Business", desc: "Send receipts and order updates straight to customers' WhatsApp.", icon: MessageCircle },
+    { name: "WhatsApp Business API", desc: "One-tap WhatsApp messages already work today from the Reminders tab. This would add official business messaging — templates, delivery confirmations, and no manual tap needed.", icon: MessageCircle },
     { name: "Accounting software (QuickBooks, Xero)", desc: "Sync your ledger so you don't enter numbers twice.", icon: BookOpen },
     { name: "SMS gateway", desc: "Low-stock and payment alerts sent by text, not just in-app.", icon: Bell },
   ];
@@ -8778,7 +8806,7 @@ function IntegrationsPanel({ setTab }) {
       <BackRow onBack={() => setTab("overview")} label="Overview" />
       <SectionTitle title="Integrations" />
       <Callout icon={Puzzle}>
-        None of these are connected yet — this needs a real backend to talk to outside services securely, which is the next phase for this app. Listed here so you can see what's planned.
+        None of these are connected yet — each needs its own backend work to talk securely to an outside service. Listed here so you can see what's planned. For WhatsApp reminders you can already use today, see the Reminders tab.
       </Callout>
       <div style={styles.list}>
         {options.map((o) => {
