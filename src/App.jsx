@@ -1121,6 +1121,11 @@ export default function App() {
     if (rpcErr) return { error: rpcErr.message };
     const business = emptyBusiness(name, categoryId, { ...details, businessId });
     if (signUpData.session) await persistBizForUser(signUpData.user.id, business);
+    // Fire-and-forget — lets you know a new business signed up without blocking their
+    // own signup flow if this happens to fail (e.g. no connection for a moment).
+    supabase.functions.invoke("notify-new-signup", {
+      body: { businessName: name, categoryId, ownerEmail: email, businessId, tier: details.tier || "starter" },
+    }).catch((e) => console.error("new signup notification failed to send", e));
     return { businessId, business, email, userId: signUpData.user?.id, needsEmailConfirm: !signUpData.session };
   };
 
@@ -3474,7 +3479,8 @@ function ItemsPanel({ biz, category, persist, notify, isOwner }) {
   const isPharmacy = biz.profile?.businessSubtypeId === "pharmacy";
   const isPropertyBiz = category.id === "property";
   const [showForm, setShowForm] = useState(false);
-  const [form, setForm] = useState({ name: "", price: "", cost: "", stock: "", meta: "", itemCategory: "", unit: "pcs", expiryDate: "", batchNumber: "", requiresPrescription: false, dueDay: "1", barcode: "" });
+  const [editingItemId, setEditingItemId] = useState(null);
+  const [form, setForm] = useState({ name: "", price: "", cost: "", stock: "", meta: "", itemCategory: "", unit: "pcs", expiryDate: "", batchNumber: "", requiresPrescription: false, dueDay: "1", barcode: "", lowStockAt: "" });
   const [showScanner, setShowScanner] = useState(false);
   const [query, setQuery] = useState("");
   const [newTag, setNewTag] = useState("");
@@ -3493,8 +3499,50 @@ function ItemsPanel({ biz, category, persist, notify, isOwner }) {
     setNewTag("");
   };
 
-  const addItem = () => {
+  const emptyItemForm = { name: "", price: "", cost: "", stock: "", meta: "", itemCategory: "", unit: "pcs", expiryDate: "", batchNumber: "", requiresPrescription: false, dueDay: "1", barcode: "", lowStockAt: "" };
+
+  const resetForm = () => {
+    setForm(emptyItemForm);
+    setEditingItemId(null);
+    setShowForm(false);
+  };
+
+  const startEditItem = (item) => {
+    setForm({
+      name: item.name, price: String(item.price), cost: String(item.cost || ""),
+      stock: "", // stock changes go through Restock, not here, so it stays tied to cost/supplier logging
+      meta: item.meta || "", itemCategory: item.category || "", unit: item.unit || "pcs",
+      expiryDate: item.expiryDate || "", batchNumber: item.batchNumber || "", requiresPrescription: !!item.requiresPrescription,
+      dueDay: String(item.dueDay || "1"), barcode: item.barcode || "", lowStockAt: String(item.lowStockAt ?? ""),
+    });
+    setEditingItemId(item.id);
+    setShowForm(true);
+  };
+
+  const saveItem = () => {
     if (!form.name.trim() || !form.price) return;
+    if (editingItemId) {
+      persist({
+        ...biz,
+        items: biz.items.map((i) => i.id !== editingItemId ? i : {
+          ...i,
+          name: form.name.trim(),
+          price: Number(form.price),
+          cost: Number(form.cost) || 0,
+          unit: category.hasStock ? (form.unit || "pcs") : undefined,
+          meta: !category.hasStock ? form.meta.trim() : undefined,
+          category: form.itemCategory.trim() || undefined,
+          lowStockAt: category.hasStock ? (Number(form.lowStockAt) || biz.settings?.defaultLowStockThreshold || 3) : undefined,
+          expiryDate: isPharmacy && form.expiryDate ? form.expiryDate : undefined,
+          batchNumber: isPharmacy && form.batchNumber.trim() ? form.batchNumber.trim() : undefined,
+          requiresPrescription: isPharmacy ? !!form.requiresPrescription : undefined,
+          dueDay: isPropertyBiz ? (Math.min(28, Math.max(1, Number(form.dueDay) || 1))) : undefined,
+          barcode: category.hasStock && form.barcode.trim() ? form.barcode.trim() : undefined,
+        }),
+      });
+      resetForm();
+      return;
+    }
     const item = {
       id: uid("item"),
       name: form.name.trim(),
@@ -3504,7 +3552,7 @@ function ItemsPanel({ biz, category, persist, notify, isOwner }) {
       unit: category.hasStock ? (form.unit || "pcs") : undefined,
       meta: !category.hasStock ? form.meta.trim() : undefined,
       category: form.itemCategory.trim() || undefined,
-      lowStockAt: 3,
+      lowStockAt: category.hasStock ? (Number(form.lowStockAt) || biz.settings?.defaultLowStockThreshold || 3) : undefined,
       branchId: biz.settings?.activeBranchId || null,
       expiryDate: isPharmacy && form.expiryDate ? form.expiryDate : undefined,
       batchNumber: isPharmacy && form.batchNumber.trim() ? form.batchNumber.trim() : undefined,
@@ -3514,8 +3562,7 @@ function ItemsPanel({ biz, category, persist, notify, isOwner }) {
     };
     let next = { ...biz, items: [item, ...biz.items] };
     persist(next);
-    setForm({ name: "", price: "", cost: "", stock: "", meta: "", itemCategory: "", unit: "pcs", expiryDate: "", batchNumber: "", requiresPrescription: false, dueDay: "1", barcode: "" });
-    setShowForm(false);
+    resetForm();
   };
 
   const removeItem = (id) => {
@@ -3579,8 +3626,8 @@ function ItemsPanel({ biz, category, persist, notify, isOwner }) {
       <div style={styles.panelHeader}>
         <SectionTitle title={category.itemLabelPlural} />
         {isOwner && (
-          <button style={styles.addBtn} onClick={() => setShowForm((s) => !s)}>
-            <Plus size={16} /> Add
+          <button style={styles.addBtn} onClick={() => (showForm ? resetForm() : setShowForm(true))}>
+            {editingItemId ? <><X size={16} /> Cancel edit</> : <><Plus size={16} /> Add</>}
           </button>
         )}
       </div>
@@ -3634,8 +3681,15 @@ function ItemsPanel({ biz, category, persist, notify, isOwner }) {
           )}
 
           {category.hasStock ? (
-            <input style={styles.textInput} type="number" step="any" placeholder={`Starting stock (${form.unit || "pcs"})`}
-              value={form.stock} onChange={(e) => setForm({ ...form, stock: e.target.value })} />
+            <>
+              {!editingItemId && (
+                <input style={styles.textInput} type="number" step="any" placeholder={`Starting stock (${form.unit || "pcs"})`}
+                  value={form.stock} onChange={(e) => setForm({ ...form, stock: e.target.value })} />
+              )}
+              {editingItemId && <p style={{ ...styles.helperText, marginTop: -6 }}>To change stock on hand, use Restock instead — that keeps your cost and supplier records accurate.</p>}
+              <input style={styles.textInput} type="number" min="0" placeholder={`Low-stock warning level (default ${biz.settings?.defaultLowStockThreshold ?? 3})`}
+                value={form.lowStockAt} onChange={(e) => setForm({ ...form, lowStockAt: e.target.value })} />
+            </>
           ) : (
             <input style={styles.textInput} type={category.id === "property" ? "text" : "number"} placeholder={category.extraFieldLabel}
               value={form.meta} onChange={(e) => setForm({ ...form, meta: e.target.value })} />
@@ -3688,8 +3742,8 @@ function ItemsPanel({ biz, category, persist, notify, isOwner }) {
             </>
           )}
 
-          <button style={styles.primaryBtnSmall} onClick={addItem}>
-            <Check size={16} /> Save {category.itemLabel.toLowerCase()}
+          <button style={styles.primaryBtnSmall} onClick={saveItem}>
+            <Check size={16} /> {editingItemId ? `Save changes` : `Save ${category.itemLabel.toLowerCase()}`}
           </button>
         </div>
       )}
@@ -3780,6 +3834,11 @@ function ItemsPanel({ biz, category, persist, notify, isOwner }) {
                   {isOwner && category.hasStock && (
                     <button style={styles.textLinkBtn} onClick={() => (restockingId === item.id ? setRestockingId(null) : openRestock(item))}>
                       Restock
+                    </button>
+                  )}
+                  {isOwner && (
+                    <button style={styles.iconBtn} title="Edit" onClick={() => startEditItem(item)}>
+                      <Pencil size={15} />
                     </button>
                   )}
                   {isOwner && (
@@ -8453,6 +8512,30 @@ function DocumentsPanel({ biz, category, persist, setTab, canEditBranding = true
   const [signatureMode, setSignatureMode] = useState("draw");
   const [colorHint, setColorHint] = useState(null);
   const [docSearch, setDocSearch] = useState("");
+  const [designRequestText, setDesignRequestText] = useState("");
+  const [sendingDesignRequest, setSendingDesignRequest] = useState(false);
+  const [designRequestSent, setDesignRequestSent] = useState(false);
+
+  const submitDesignRequest = async () => {
+    const clean = designRequestText.trim();
+    if (!clean) { alert("Describe what you're after first."); return; }
+    setSendingDesignRequest(true);
+    try {
+      const { error } = await supabase.from("support_tickets").insert({
+        request_type: "design",
+        message: clean,
+        business_name: biz.profile.name || "",
+        business_short_id: biz.profile.businessId || "",
+      });
+      if (error) throw error;
+      setDesignRequestText("");
+      setDesignRequestSent(true);
+    } catch (e) {
+      alert("Couldn't send that — check your connection and try again.");
+    } finally {
+      setSendingDesignRequest(false);
+    }
+  };
 
   const branding = biz.profile.branding || {};
   const [address, setAddress] = useState(branding.address || "");
@@ -8621,6 +8704,22 @@ function DocumentsPanel({ biz, category, persist, setTab, canEditBranding = true
                 <input type="file" accept="image/*" style={{ display: "none" }} onChange={onSampleDoc} />
               </label>
               <p style={styles.helperText}>This can pick out a brand color from it for you. Automatically pulling out the logo, signature, and address from a photo needs an AI step — that'll connect once the backend is built. For now, add those individually above.</p>
+            </div>
+
+            <div style={{ borderTop: "1px solid var(--line)", paddingTop: 14, marginTop: 4 }}>
+              <div style={styles.listRowTitle}>Want something more custom?</div>
+              <p style={styles.helperText}>Beyond a logo and color — a fully custom look for your app. Describe what you have in mind and we'll follow up.</p>
+              {designRequestSent ? (
+                <p style={{ ...styles.helperText, color: "#22A06B" }}>Sent — we'll be in touch.</p>
+              ) : (
+                <>
+                  <textarea style={{ ...styles.textArea, minHeight: 70 }} placeholder="e.g. a warmer color palette, a different layout style, icons that match my industry…"
+                    value={designRequestText} onChange={(e) => setDesignRequestText(e.target.value)} />
+                  <button style={styles.primaryBtnSmall} disabled={sendingDesignRequest} onClick={submitDesignRequest}>
+                    {sendingDesignRequest ? "Sending…" : "Send request"}
+                  </button>
+                </>
+              )}
             </div>
           </div>
         )}
@@ -8988,8 +9087,14 @@ function SettingsPanel({ biz, category, persist, setTab, onLogout, account }) {
   const [phone, setPhone] = useState(biz.profile.phone || "");
   const [location, setLocation] = useState(biz.profile.location || "");
   const [discountThreshold, setDiscountThreshold] = useState(String(biz.settings?.discountThreshold || ""));
+  const [defaultLowStock, setDefaultLowStock] = useState(String(biz.settings?.defaultLowStockThreshold ?? 3));
   const [newCategoryTag, setNewCategoryTag] = useState("");
   const bizCategories = biz.categories || [];
+
+  const saveLowStockDefault = () => {
+    const val = Math.max(0, Number(defaultLowStock) || 0);
+    persist({ ...biz, settings: { ...biz.settings, defaultLowStockThreshold: val } });
+  };
 
   const saveProfile = () => {
     persist({ ...biz, profile: { ...biz.profile, name: name.trim() || biz.profile.name, categoryId, phone: phone.trim(), location: location.trim(), logoInitial: (name.trim() || biz.profile.name)[0]?.toUpperCase() } });
@@ -9056,6 +9161,17 @@ function SettingsPanel({ biz, category, persist, setTab, onLogout, account }) {
         <input style={styles.textInput} value={location} onChange={(e) => setLocation(e.target.value)} placeholder="Location / town" />
         <button style={styles.primaryBtnSmall} onClick={saveProfile}><Check size={16} /> Save profile</button>
       </div>
+
+      {category.hasStock && (
+        <>
+          <SectionTitle title="Inventory" small />
+          <div style={styles.formCard}>
+            <p style={styles.helperText}>New {category.itemLabelPlural.toLowerCase()} start with this low-stock warning level. You can set a different one for any item as you add it.</p>
+            <input style={styles.textInputHalf} type="number" min="0" value={defaultLowStock} onChange={(e) => setDefaultLowStock(e.target.value)} placeholder="e.g. 3" />
+            <button style={styles.primaryBtnSmall} onClick={saveLowStockDefault}><Check size={16} /> Save default</button>
+          </div>
+        </>
+      )}
 
       <SectionTitle title="Sales recording" small />
       <div style={styles.formCard}>
