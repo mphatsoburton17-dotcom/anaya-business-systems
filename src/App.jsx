@@ -1541,6 +1541,13 @@ const LP_BUSINESS_TYPES = [
 ];
 
 function LandingPage({ onGetStarted, onLogin, onShowTerms }) {
+  // Logs a single, anonymous visit each time someone lands here — no personal
+  // data, just a timestamp, so real traffic is visible in the admin panel
+  // (separate from actual signups, which are tracked in the businesses table).
+  useEffect(() => {
+    supabase.from("app_visits").insert({}).then(() => {}, () => {});
+  }, []);
+
   const s = {
     page: { fontFamily: "'Inter', sans-serif", background: BRAND.bg, color: BRAND.ink, minHeight: "100vh", overflowX: "hidden" },
     wrap: { maxWidth: 1080, margin: "0 auto", padding: "0 24px" },
