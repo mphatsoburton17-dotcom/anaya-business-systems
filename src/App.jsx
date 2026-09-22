@@ -8,7 +8,7 @@ import {
   Sparkles, Building2, Smartphone, Layers, Pencil, Share2,
   ShoppingCart, Shirt, Hammer, Sofa, Pill, Wheat, GraduationCap, UtensilsCrossed, Cookie, Beer, Car,
   ClipboardList, Truck, CalendarClock, ChevronLeft, PiggyBank, PackageCheck, ScanLine,
-  Lightbulb, CheckCircle2
+  Lightbulb, CheckCircle2, Send
 } from "lucide-react";
 import * as XLSX from "xlsx";
 import { supabase } from "./supabaseClient";
@@ -758,7 +758,7 @@ async function fetchBizForUser(userId) {
   const base = stored || emptyBusiness(row.name, row.category_id, { businessId: row.business_id });
   return {
     ...base,
-    profile: { ...base.profile, name: row.name, categoryId: row.category_id, businessId: row.business_id },
+    profile: { ...base.profile, name: row.name, categoryId: row.category_id, businessId: row.business_id, businessRowId: row.id },
   };
 }
 async function persistBizForUser(userId, biz) {
@@ -1050,7 +1050,13 @@ export default function App() {
     if (!migrated) { setBiz(null); setAccount(null); setSession(null); setMyBusinesses([]); return; }
     setBiz(migrated);
     setAccount({ email: authSession.user.email, userId: authSession.user.id });
-    setSession(migrated.employees[0]?.id || null);
+    // A staff member's own login (created via "Create login" in Staff & HR) carries their
+    // employee id in their account metadata — use that so they land on their own profile,
+    // not the owner's. Anyone without that metadata (the owner's real account) still
+    // defaults to employees[0], same as before.
+    const linkedEmployeeId = authSession.user.user_metadata?.employeeId;
+    const linkedEmployeeExists = linkedEmployeeId && migrated.employees.some((e) => e.id === linkedEmployeeId);
+    setSession(linkedEmployeeExists ? linkedEmployeeId : migrated.employees[0]?.id || null);
     fetchMyBusinesses(authSession.user.id).then(setMyBusinesses);
   }, [loadActiveBiz]);
 
@@ -1332,6 +1338,25 @@ export default function App() {
 
   const canSee = (moduleId) => isOwner || isManager || hasModuleAccess(currentEmployee, moduleId);
 
+  const [unreadMessages, setUnreadMessages] = useState(0);
+  useEffect(() => {
+    const businessRowId = biz.profile?.businessRowId;
+    if (!businessRowId || !currentEmployee) return;
+    let cancelled = false;
+    const computeAndSet = async () => {
+      let query = supabase.from("chat_messages").select("id, thread_employee_id, sender_employee_id, read_at").eq("business_id", businessRowId);
+      if (!isOwner) query = query.eq("thread_employee_id", currentEmployee.id);
+      const { data } = await query;
+      if (cancelled || !data) return;
+      setUnreadMessages(data.filter((m) => m.sender_employee_id !== currentEmployee.id && !m.read_at).length);
+    };
+    computeAndSet();
+    const channel = supabase.channel(`unread-badge-${businessRowId}`)
+      .on("postgres_changes", { event: "*", schema: "public", table: "chat_messages", filter: `business_id=eq.${businessRowId}` }, computeAndSet)
+      .subscribe();
+    return () => { cancelled = true; supabase.removeChannel(channel); };
+  }, [biz.profile?.businessRowId, currentEmployee?.id, isOwner]);
+
   return (
     <div style={{ ...styles.appShell, ...themeVars }} className="app-shell">
       <style>{fontImports}</style>
@@ -1339,6 +1364,7 @@ export default function App() {
         biz={biz} category={category} tab={tab} setTab={setTab}
         isOwner={isOwner} isManager={isManager} canSee={canSee}
         unread={biz.notifications.filter((n) => !n.read).length}
+        unreadMessages={unreadMessages}
       />
       <div className="app-main">
       {!isOnline && (
@@ -1360,7 +1386,7 @@ export default function App() {
 
       <div style={styles.body} className="app-body">
         {tab === "overview" && (
-          <Overview biz={biz} category={category} isOwner={isStaffView} setTab={setTab} />
+          <Overview biz={biz} category={category} isOwner={isStaffView} setTab={setTab} persist={persist} />
         )}
         {tab === "items" && (
           <ItemsPanel biz={biz} category={category} persist={persist} notify={notify} isOwner={isFullAccess || isManager || canEditModule(currentEmployee, "sales")} />
@@ -1448,6 +1474,9 @@ export default function App() {
         )}
         {tab === "terms" && (
           <TermsScreen onBack={() => setTab("settings")} />
+        )}
+        {tab === "messages" && (
+          <MessagesPanel biz={biz} category={category} currentEmployee={currentEmployee} account={account} isOwner={isOwner} setTab={setTab} />
         )}
         {tab === "help" && (
           <HelpPanel setTab={setTab} biz={biz} account={account} />
@@ -2730,13 +2759,14 @@ function TopBar({ biz, category, currentEmployee, onSwitchRole, persist }) {
 /* =========================================================
    SIDEBAR (desktop / wide screens only — see .app-sidebar CSS)
    ========================================================= */
-function Sidebar({ biz, category, tab, setTab, isOwner, isManager, canSee, unread }) {
+function Sidebar({ biz, category, tab, setTab, isOwner, isManager, canSee, unread, unreadMessages }) {
   const groups = [
     {
       title: "Overview",
       rows: [
         { id: "overview", label: "Dashboard", icon: BarChart3, show: true },
         { id: "alerts", label: "Alerts", icon: Bell, badge: unread, show: true },
+        { id: "messages", label: "Messages", icon: Send, badge: unreadMessages, show: true },
         { id: "reminders", label: "Reminders", icon: MessageCircle, show: true },
         { id: "calendar", label: "Calendar", icon: CalendarClock, show: true },
       ],
@@ -2835,7 +2865,7 @@ function Sidebar({ biz, category, tab, setTab, isOwner, isManager, canSee, unrea
 /* =========================================================
    OVERVIEW
    ========================================================= */
-function Overview({ biz, category, isOwner, setTab }) {
+function Overview({ biz, category, isOwner, setTab, persist }) {
   const [statsPeriod, setStatsPeriod] = useState("today"); // today | week | month | all
 
   const branchOrders = filterByBranch(biz.orders, biz.settings?.activeBranchId);
@@ -2994,6 +3024,47 @@ function Overview({ biz, category, isOwner, setTab }) {
   return (
     <div style={styles.panel}>
       <SectionTitle title="Overview" />
+
+      {isOwner && (() => {
+        // A short "do these 3 things" checklist for brand-new businesses. Steps are
+        // derived from real data (not a separate flag) so it's always accurate, and
+        // it disappears on its own once every step is done — no need to dismiss it.
+        const dismissed = !!biz.settings?.onboardingChecklistDismissed;
+        if (dismissed) return null;
+
+        const steps = [
+          { done: biz.items.length > 0, label: `Add your first ${category.itemLabel.toLowerCase()}`, tab: "items" },
+          { done: biz.orders.length > 0, label: `Record your first ${category.orderNoun.toLowerCase()}`, tab: "orders" },
+          { done: biz.customers.length > 0, label: `Add your first ${category.customerNoun.toLowerCase()}`, tab: "customers" },
+        ];
+        const doneCount = steps.filter((s) => s.done).length;
+        if (doneCount === steps.length) return null; // all done — nothing more to show
+
+        const dismiss = () => persist({ ...biz, settings: { ...biz.settings, onboardingChecklistDismissed: true } });
+
+        return (
+          <div className="lift-card" style={{ ...styles.trendCard, background: "linear-gradient(135deg, rgba(20,73,176,0.06), rgba(20,73,176,0.02))" }}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 4 }}>
+              <div>
+                <div style={{ ...styles.trendHeader, marginBottom: 2 }}>Getting started</div>
+                <div style={{ fontSize: 13, color: "var(--ink-faint)" }}>{doneCount} of {steps.length} done</div>
+              </div>
+              <button style={styles.iconBtn} title="Dismiss" onClick={dismiss}><X size={14} /></button>
+            </div>
+            <div style={{ display: "flex", flexDirection: "column", gap: 4, marginTop: 10 }}>
+              {steps.map((s, i) => (
+                <button key={i} type="button" style={{ all: "unset", cursor: s.done ? "default" : "pointer", display: "flex", alignItems: "center", gap: 10, padding: "8px 4px" }}
+                  onClick={() => !s.done && setTab(s.tab)}>
+                  {s.done ? <CheckCircle2 size={18} color="#22A06B" style={{ flexShrink: 0 }} /> : <div style={{ width: 18, height: 18, borderRadius: "50%", border: "2px solid var(--line)", flexShrink: 0 }} />}
+                  <span style={{ fontSize: 14, color: s.done ? "var(--ink-faint)" : "var(--ink)", textDecoration: s.done ? "line-through" : "none" }}>{s.label}</span>
+                  {!s.done && <ChevronRight size={15} color="var(--ink-faint)" style={{ marginLeft: "auto" }} />}
+                </button>
+              ))}
+            </div>
+          </div>
+        );
+      })()}
+
       {isOwner && isTrialActive(biz.profile) && (
         <Callout icon={Wallet}>
           Free trial — every tool is unlocked. {trialDaysLeft(biz.profile)} day{trialDaysLeft(biz.profile) !== 1 ? "s" : ""} left.
@@ -3494,6 +3565,10 @@ function ItemsPanel({ biz, category, persist, notify, isOwner }) {
   const [restockingId, setRestockingId] = useState(null); // item id currently showing the restock form
   const [restockForm, setRestockForm] = useState({ qty: "", costPerUnit: "", supplierId: "", supplier: "", logExpense: true });
   const [sortBy, setSortBy] = useState("recent"); // recent | low-stock | az | price
+  const [tripActive, setTripActive] = useState(false);
+  const [tripBudget, setTripBudget] = useState("");
+  const [tripLines, setTripLines] = useState([]); // { id, name, matchedItemId, cost, qty, sellPrice }
+  const [tripEntry, setTripEntry] = useState({ name: "", cost: "", qty: "1", sellPrice: "" });
   const bizCategories = biz.categories || [];
   const suppliers = biz.suppliers || [];
 
@@ -3572,6 +3647,76 @@ function ItemsPanel({ biz, category, persist, notify, isOwner }) {
     resetForm();
   };
 
+  // ---------------- Stocking trip: log each purchase as you buy it, with a running
+  // budget total — built for stocking up a new shop or a market restocking run,
+  // where you're adding several items in one sitting rather than one at a time. ----------------
+  const matchExistingItem = (name) => {
+    const clean = name.trim().toLowerCase();
+    if (!clean) return null;
+    return biz.items.find((i) => i.name.trim().toLowerCase() === clean) || null;
+  };
+
+  const addTripLine = () => {
+    const name = tripEntry.name.trim();
+    const cost = Number(tripEntry.cost);
+    const qty = Number(tripEntry.qty) || 1;
+    if (!name || !cost || cost < 0 || qty <= 0) return;
+    const matched = matchExistingItem(name);
+    if (!matched && !tripEntry.sellPrice) { alert(`"${name}" isn't in your items yet — add a selling price for it too, so it's ready to sell.`); return; }
+    setTripLines((lines) => [...lines, {
+      id: uid("tripline"), name, matchedItemId: matched?.id || null,
+      cost, qty, sellPrice: matched ? null : Number(tripEntry.sellPrice),
+    }]);
+    setTripEntry({ name: "", cost: "", qty: "1", sellPrice: "" });
+  };
+  const removeTripLine = (id) => setTripLines((lines) => lines.filter((l) => l.id !== id));
+
+  const tripTotal = tripLines.reduce((s, l) => s + l.cost * l.qty, 0);
+  const tripBudgetNum = Number(tripBudget) || 0;
+  const tripRemaining = tripBudgetNum - tripTotal;
+
+  const cancelTrip = () => { setTripActive(false); setTripBudget(""); setTripLines([]); setTripEntry({ name: "", cost: "", qty: "1", sellPrice: "" }); };
+
+  const finishTrip = () => {
+    if (tripLines.length === 0) { cancelTrip(); return; }
+    const nowTs = Date.now();
+    const branchId = biz.settings?.activeBranchId || biz.branches?.[0]?.id || null;
+    let nextItems = [...biz.items];
+    const newRestocks = [];
+    let newCount = 0;
+
+    tripLines.forEach((line) => {
+      if (line.matchedItemId) {
+        nextItems = nextItems.map((i) => i.id === line.matchedItemId ? { ...i, stock: (i.stock || 0) + line.qty, cost: line.cost } : i);
+        newRestocks.push({
+          id: uid("restock"), itemId: line.matchedItemId, itemName: line.name, qty: line.qty,
+          unit: nextItems.find((i) => i.id === line.matchedItemId)?.unit || "pcs",
+          costPerUnit: line.cost, totalCost: line.cost * line.qty, supplier: null, supplierId: null,
+          sellPriceAtTime: nextItems.find((i) => i.id === line.matchedItemId)?.price, ts: nowTs, branchId,
+        });
+      } else {
+        newCount += 1;
+        nextItems = [{
+          id: uid("item"), name: line.name, price: line.sellPrice, cost: line.cost,
+          stock: category.hasStock ? line.qty : undefined, unit: category.hasStock ? "pcs" : undefined,
+          lowStockAt: category.hasStock ? (biz.settings?.defaultLowStockThreshold || 3) : undefined,
+          branchId,
+        }, ...nextItems];
+      }
+    });
+
+    const exp = {
+      id: uid("exp"), category: "Restocking / buying stock", amount: tripTotal,
+      note: `Stocking trip — ${tripLines.length} item${tripLines.length !== 1 ? "s" : ""}${newCount ? ` (${newCount} new)` : ""}`,
+      branchId, ts: nowTs,
+    };
+
+    let next = { ...biz, items: nextItems, restocks: [...newRestocks, ...(biz.restocks || [])], expenses: [exp, ...biz.expenses] };
+    next = notify(next, "stock", `Stocking trip finished — ${currency(tripTotal)} spent across ${tripLines.length} item${tripLines.length !== 1 ? "s" : ""}`);
+    persist(next);
+    cancelTrip();
+  };
+
   const removeItem = (id) => {
     const item = biz.items.find((i) => i.id === id);
     if (!window.confirm(`Remove "${item?.name || "this item"}"? This can't be undone.`)) return;
@@ -3632,12 +3777,77 @@ function ItemsPanel({ biz, category, persist, notify, isOwner }) {
     <div style={styles.panel}>
       <div style={styles.panelHeader}>
         <SectionTitle title={category.itemLabelPlural} />
-        {isOwner && (
-          <button style={styles.addBtn} onClick={() => (showForm ? resetForm() : setShowForm(true))}>
-            {editingItemId ? <><X size={16} /> Cancel edit</> : <><Plus size={16} /> Add</>}
-          </button>
-        )}
+        <div style={{ display: "flex", gap: 8 }}>
+          {isOwner && category.hasStock && !tripActive && (
+            <button style={{ ...styles.addBtn, background: "var(--surface)", color: "var(--accent)", border: "1px solid var(--accent)" }} onClick={() => setTripActive(true)}>
+              <ShoppingCart size={16} /> Stocking trip
+            </button>
+          )}
+          {isOwner && (
+            <button style={styles.addBtn} onClick={() => (showForm ? resetForm() : setShowForm(true))}>
+              {editingItemId ? <><X size={16} /> Cancel edit</> : <><Plus size={16} /> Add</>}
+            </button>
+          )}
+        </div>
       </div>
+
+      {tripActive && (
+        <div style={{ ...styles.formCard, border: "1px solid var(--accent)" }}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 4 }}>
+            <div style={{ fontWeight: 700, fontSize: 15 }}>Stocking trip</div>
+            <button style={styles.iconBtn} title="Cancel trip" onClick={cancelTrip}><X size={15} /></button>
+          </div>
+          <p style={{ ...styles.helperText, marginTop: 0 }}>Log each item as you buy it. Existing items get restocked; new names create a fresh item automatically.</p>
+
+          <input style={styles.textInput} type="number" placeholder="Budget for this trip (optional)" value={tripBudget} onChange={(e) => setTripBudget(e.target.value)} />
+
+          {(tripBudgetNum > 0 || tripLines.length > 0) && (
+            <div style={{ display: "flex", justifyContent: "space-between", background: "var(--bg)", borderRadius: 8, padding: "10px 12px", marginBottom: 12, fontSize: 13.5 }}>
+              <span>Spent: <strong>{currency(tripTotal)}</strong></span>
+              {tripBudgetNum > 0 && <span style={{ color: tripRemaining < 0 ? "#B23A2E" : "var(--ink-soft)" }}>{tripRemaining < 0 ? `${currency(Math.abs(tripRemaining))} over budget` : `${currency(tripRemaining)} left`}</span>}
+            </div>
+          )}
+
+          {tripLines.length > 0 && (
+            <div style={{ marginBottom: 14 }}>
+              {tripLines.map((l) => (
+                <div key={l.id} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "8px 0", borderBottom: "1px solid var(--line)" }}>
+                  <div>
+                    <div style={{ fontSize: 13.5, fontWeight: 600 }}>{l.name} {!l.matchedItemId && <span style={{ ...styles.badge, background: "var(--accent-soft)", color: "var(--accent)", marginLeft: 6 }}>New</span>}</div>
+                    <div style={{ fontSize: 12, color: "var(--ink-faint)" }}>{l.qty} × {currency(l.cost)}</div>
+                  </div>
+                  <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                    <span style={styles.mono}>{currency(l.cost * l.qty)}</span>
+                    <button style={styles.iconBtn} onClick={() => removeTripLine(l.id)}><Trash2 size={14} /></button>
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+
+          <div style={styles.miniLabel}>Add what you just bought</div>
+          <input style={styles.textInput} placeholder={`${category.itemLabel} name`} value={tripEntry.name} onChange={(e) => setTripEntry({ ...tripEntry, name: e.target.value })} />
+          {tripEntry.name.trim() && !matchExistingItem(tripEntry.name) && (
+            <p style={{ ...styles.helperText, marginTop: -8, color: "var(--accent)" }}>New {category.itemLabel.toLowerCase()} — add a selling price below so it's ready to sell.</p>
+          )}
+          <div style={{ display: "flex", gap: 8 }}>
+            <input style={{ ...styles.textInput, flex: 1 }} type="number" placeholder="Cost per unit" value={tripEntry.cost} onChange={(e) => setTripEntry({ ...tripEntry, cost: e.target.value })} />
+            <input style={{ ...styles.textInput, flex: 1 }} type="number" placeholder="Quantity" value={tripEntry.qty} onChange={(e) => setTripEntry({ ...tripEntry, qty: e.target.value })} />
+          </div>
+          {tripEntry.name.trim() && !matchExistingItem(tripEntry.name) && (
+            <input style={styles.textInput} type="number" placeholder="Selling price for this new item" value={tripEntry.sellPrice} onChange={(e) => setTripEntry({ ...tripEntry, sellPrice: e.target.value })} />
+          )}
+          <button style={{ ...styles.primaryBtnSmall, background: "var(--surface)", color: "var(--accent)", border: "1px solid var(--accent)" }} onClick={addTripLine}>
+            <Plus size={16} /> Add to list
+          </button>
+
+          {tripLines.length > 0 && (
+            <button style={{ ...styles.primaryBtnSmall, marginTop: 10 }} onClick={finishTrip}>
+              <Check size={16} /> Finish trip — apply {tripLines.length} item{tripLines.length !== 1 ? "s" : ""}
+            </button>
+          )}
+        </div>
+      )}
 
       {showForm && (
         <div style={styles.formCard}>
@@ -4959,6 +5169,195 @@ function BackRow({ onBack, label }) {
   );
 }
 
+/* =========================================================
+   MESSAGES — direct chat between the owner and each staff member, one
+   thread per person. Live delivery and read receipts both come from
+   Supabase Realtime on the chat_messages table (see chat_messages_setup.sql).
+   ========================================================= */
+function ChatThread({ biz, currentEmployee, account, threadEmployeeId, otherPartyName, onBack }) {
+  const [messages, setMessages] = useState([]);
+  const [text, setText] = useState("");
+  const [loading, setLoading] = useState(true);
+  const bottomRef = useRef(null);
+  const businessRowId = biz.profile?.businessRowId;
+
+  const markIncomingAsRead = useCallback(async (rows) => {
+    const unreadIds = rows.filter((m) => m.sender_employee_id !== currentEmployee.id && !m.read_at).map((m) => m.id);
+    if (unreadIds.length === 0) return;
+    await supabase.from("chat_messages").update({ read_at: new Date().toISOString() }).in("id", unreadIds);
+  }, [currentEmployee.id]);
+
+  useEffect(() => {
+    if (!businessRowId) return;
+    let cancelled = false;
+    (async () => {
+      setLoading(true);
+      const { data, error } = await supabase.from("chat_messages").select("*")
+        .eq("business_id", businessRowId).eq("thread_employee_id", threadEmployeeId)
+        .order("created_at", { ascending: true });
+      if (!cancelled) {
+        if (!error && data) { setMessages(data); markIncomingAsRead(data); }
+        setLoading(false);
+      }
+    })();
+
+    // Live updates — new messages and read-receipt changes push in instantly.
+    const channel = supabase.channel(`chat-${businessRowId}-${threadEmployeeId}`)
+      .on("postgres_changes", { event: "INSERT", schema: "public", table: "chat_messages", filter: `thread_employee_id=eq.${threadEmployeeId}` }, (payload) => {
+        setMessages((prev) => [...prev, payload.new]);
+        markIncomingAsRead([payload.new]);
+      })
+      .on("postgres_changes", { event: "UPDATE", schema: "public", table: "chat_messages", filter: `thread_employee_id=eq.${threadEmployeeId}` }, (payload) => {
+        setMessages((prev) => prev.map((m) => m.id === payload.new.id ? payload.new : m));
+      })
+      .subscribe();
+
+    return () => { cancelled = true; supabase.removeChannel(channel); };
+  }, [businessRowId, threadEmployeeId, markIncomingAsRead]);
+
+  useEffect(() => { bottomRef.current?.scrollIntoView({ behavior: "smooth" }); }, [messages.length]);
+
+  const send = async () => {
+    const clean = text.trim();
+    if (!clean || !businessRowId) return;
+    setText("");
+    const { error } = await supabase.from("chat_messages").insert({
+      business_id: businessRowId, thread_employee_id: threadEmployeeId,
+      sender_employee_id: currentEmployee.id, sender_name: currentEmployee.name,
+      sender_user_id: account.userId, message: clean,
+    });
+    if (error) { alert("Couldn't send — check your connection and try again."); setText(clean); }
+  };
+
+  const lastOwnMessage = [...messages].reverse().find((m) => m.sender_employee_id === currentEmployee.id);
+
+  return (
+    <div style={styles.panel}>
+      <BackRow onBack={onBack} label="Messages" />
+      <SectionTitle title={otherPartyName} />
+      <div style={{ display: "flex", flexDirection: "column", gap: 8, minHeight: 320, maxHeight: "55vh", overflowY: "auto", padding: "4px 2px", marginBottom: 12 }}>
+        {loading ? (
+          <p style={styles.helperText}>Loading…</p>
+        ) : messages.length === 0 ? (
+          <EmptyState text={`No messages yet — say hello to ${otherPartyName}.`} icon={MessageCircle} />
+        ) : (
+          messages.map((m) => {
+            const mine = m.sender_employee_id === currentEmployee.id;
+            return (
+              <div key={m.id} style={{ display: "flex", justifyContent: mine ? "flex-end" : "flex-start" }}>
+                <div style={{
+                  maxWidth: "78%", padding: "9px 13px", borderRadius: 14,
+                  background: mine ? "var(--accent)" : "var(--surface)",
+                  color: mine ? "#fff" : "var(--ink)",
+                  border: mine ? "none" : "1px solid var(--line)",
+                  fontSize: 14, lineHeight: 1.4,
+                }}>
+                  {m.message}
+                  <div style={{ fontSize: 10.5, opacity: 0.7, marginTop: 3, textAlign: "right" }}>
+                    {new Date(m.created_at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}
+                  </div>
+                </div>
+              </div>
+            );
+          })
+        )}
+        {lastOwnMessage && (
+          <div style={{ textAlign: "right", fontSize: 11, color: "var(--ink-faint)", paddingRight: 4 }}>
+            {lastOwnMessage.read_at ? "Seen" : "Delivered"}
+          </div>
+        )}
+        <div ref={bottomRef} />
+      </div>
+      <div style={{ display: "flex", gap: 8 }}>
+        <input style={{ ...styles.textInput, flex: 1, marginBottom: 0 }} placeholder="Type a message…" value={text}
+          onChange={(e) => setText(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter") send(); }} />
+        <button style={{ ...styles.primaryBtnSmall, width: "auto", padding: "0 18px" }} onClick={send} disabled={!text.trim()}>
+          <Check size={16} />
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function MessagesPanel({ biz, category, currentEmployee, account, isOwner, setTab }) {
+  const [openThreadId, setOpenThreadId] = useState(null);
+  const [unreadByThread, setUnreadByThread] = useState({});
+  const businessRowId = biz.profile?.businessRowId;
+
+  // Owner sees a list of staff to pick a thread; a staff member only ever has one
+  // thread (with the owner), so skip straight to it.
+  const staffList = biz.employees.filter((e) => e.pin !== "0000");
+  const owner = biz.employees.find((e) => e.pin === "0000");
+
+  useEffect(() => {
+    if (!isOwner || !businessRowId) return;
+    let cancelled = false;
+    (async () => {
+      const { data } = await supabase.from("chat_messages").select("thread_employee_id, sender_employee_id, read_at")
+        .eq("business_id", businessRowId);
+      if (cancelled || !data) return;
+      const counts = {};
+      data.forEach((m) => {
+        if (m.sender_employee_id !== currentEmployee.id && !m.read_at) counts[m.thread_employee_id] = (counts[m.thread_employee_id] || 0) + 1;
+      });
+      setUnreadByThread(counts);
+    })();
+    const channel = supabase.channel(`chat-list-${businessRowId}`)
+      .on("postgres_changes", { event: "*", schema: "public", table: "chat_messages", filter: `business_id=eq.${businessRowId}` }, () => {
+        supabase.from("chat_messages").select("thread_employee_id, sender_employee_id, read_at").eq("business_id", businessRowId).then(({ data }) => {
+          if (!data) return;
+          const counts = {};
+          data.forEach((m) => { if (m.sender_employee_id !== currentEmployee.id && !m.read_at) counts[m.thread_employee_id] = (counts[m.thread_employee_id] || 0) + 1; });
+          setUnreadByThread(counts);
+        });
+      })
+      .subscribe();
+    return () => { cancelled = true; supabase.removeChannel(channel); };
+  }, [isOwner, businessRowId, currentEmployee.id]);
+
+  if (!isOwner) {
+    return (
+      <ChatThread biz={biz} currentEmployee={currentEmployee} account={account}
+        threadEmployeeId={currentEmployee.id} otherPartyName={owner?.name || "Owner"}
+        onBack={() => setTab("overview")} />
+    );
+  }
+
+  if (openThreadId) {
+    const staffMember = staffList.find((s) => s.id === openThreadId);
+    return (
+      <ChatThread biz={biz} currentEmployee={currentEmployee} account={account}
+        threadEmployeeId={openThreadId} otherPartyName={staffMember?.name || "Staff"}
+        onBack={() => setOpenThreadId(null)} />
+    );
+  }
+
+  return (
+    <div style={styles.panel}>
+      <SectionTitle title="Messages" />
+      <p style={styles.helperText}>A direct line to each staff member — separate from switching profiles.</p>
+      {staffList.length === 0 ? (
+        <EmptyState text="Add a staff member first, then you can message them here." icon={MessageCircle} />
+      ) : (
+        <div style={styles.list}>
+          {staffList.map((s) => (
+            <button key={s.id} className="lift-card" style={styles.listRowClickable} onClick={() => setOpenThreadId(s.id)}>
+              <div>
+                <div style={styles.listRowTitle}>{s.name}</div>
+                <div style={styles.listRowSub}>{s.role || "Staff"}</div>
+              </div>
+              <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                {unreadByThread[s.id] > 0 && <span style={{ ...styles.badge, background: "#B23A2E", color: "#fff" }}>{unreadByThread[s.id]}</span>}
+                <ChevronRight size={16} color="var(--ink-faint)" />
+              </div>
+            </button>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function EmployeesPanel({ biz, category, persist, setTab, currentEmployee }) {
   const isViewerOwner = currentEmployee?.role === "owner" || currentEmployee?.role === "full";
   const isViewerManager = currentEmployee?.role === "manager";
@@ -4976,6 +5375,39 @@ function EmployeesPanel({ biz, category, persist, setTab, currentEmployee }) {
   const [editingPayId, setEditingPayId] = useState(null);
   const [hoursInput, setHoursInput] = useState("");
   const [payFormId, setPayFormId] = useState(null); // employee id whose "add pay record" form is open
+  const [loginBusyId, setLoginBusyId] = useState(null);
+  const [revealedCreds, setRevealedCreds] = useState(null); // { employeeId, email, password } — shown once
+
+  const createStaffLogin = async (emp) => {
+    setLoginBusyId(emp.id);
+    try {
+      const { data, error } = await supabase.functions.invoke("staff-login-manage", {
+        body: { type: "create_staff_login", employeeId: emp.id, employeeName: emp.name },
+      });
+      if (error || data?.error) { alert(data?.error || "Couldn't create a login for this person."); return; }
+      persist({ ...biz, employees: biz.employees.map((x) => x.id === emp.id ? { ...x, loginUserId: data.loginUserId, loginEmail: data.email } : x) });
+      setRevealedCreds({ employeeId: emp.id, email: data.email, password: data.password });
+    } catch (e) {
+      alert("Couldn't reach the server — check your connection and try again.");
+    } finally {
+      setLoginBusyId(null);
+    }
+  };
+
+  const resetStaffPassword = async (emp) => {
+    setLoginBusyId(emp.id);
+    try {
+      const { data, error } = await supabase.functions.invoke("staff-login-manage", {
+        body: { type: "reset_staff_password", loginUserId: emp.loginUserId },
+      });
+      if (error || data?.error) { alert(data?.error || "Couldn't reset the password."); return; }
+      setRevealedCreds({ employeeId: emp.id, email: emp.loginEmail, password: data.password });
+    } catch (e) {
+      alert("Couldn't reach the server — check your connection and try again.");
+    } finally {
+      setLoginBusyId(null);
+    }
+  };
   const [payForm, setPayForm] = useState({ type: "salary", amount: "", note: "", date: new Date().toISOString().slice(0, 10) });
 
   const seatLimit = seatLimitFor(biz);
@@ -5350,6 +5782,33 @@ function EmployeesPanel({ biz, category, persist, setTab, currentEmployee }) {
                       <button style={styles.smallAddBtn} onClick={() => savePayRecord(e)}>Save record</button>
                     </div>
                   )}
+                  {e.pin !== "0000" && (
+                    <div style={styles.staffDetailLine}>
+                      Device login (own phone/laptop):{" "}
+                      {e.loginUserId ? (
+                        <>
+                          <span style={{ color: "var(--ink-faint)" }}>{e.loginEmail}</span>{" "}
+                          <button type="button" style={styles.textLinkBtn} disabled={loginBusyId === e.id} onClick={() => resetStaffPassword(e)}>
+                            {loginBusyId === e.id ? "Working…" : "Reset password"}
+                          </button>
+                        </>
+                      ) : (
+                        <button type="button" style={styles.textLinkBtn} disabled={loginBusyId === e.id} onClick={() => createStaffLogin(e)}>
+                          {loginBusyId === e.id ? "Creating…" : "Create login"}
+                        </button>
+                      )}
+                    </div>
+                  )}
+                  {revealedCreds?.employeeId === e.id && (
+                    <div style={{ ...styles.formCard, marginTop: 8, marginBottom: 8 }}>
+                      <div style={{ fontWeight: 700, fontSize: 13.5, marginBottom: 6 }}>Share these with {e.name} — shown only once</div>
+                      <div style={{ fontSize: 13, marginBottom: 4 }}>Email: <span style={styles.mono}>{revealedCreds.email}</span></div>
+                      <div style={{ fontSize: 13, marginBottom: 8 }}>Password: <span style={styles.mono}>{revealedCreds.password}</span></div>
+                      <p style={{ ...styles.helperText, marginTop: 0 }}>They log in with these on their own phone or laptop, on the normal login screen — no need to switch profiles on your device anymore.</p>
+                      <button style={styles.textLinkBtn} onClick={() => setRevealedCreds(null)}>Done, I've saved this</button>
+                    </div>
+                  )}
+
                   {(e.payRecords || []).slice(0, 5).map((r) => (
                     <div key={r.id} style={styles.staffDetailLine}>
                       {r.date} · {({ salary: "Salary", wage: "Wage", loan: "Loan given", loan_repayment: "Loan repaid" })[r.type]} · {currency(r.amount)}
@@ -8761,7 +9220,12 @@ function DocumentsPanel({ biz, category, persist, setTab, canEditBranding = true
                 {aiDrafting ? "…" : "Draft"}
               </button>
             </div>
-            {aiDraftError && <div style={styles.authError}>{aiDraftError}</div>}
+            {aiDraftError && (
+              <div style={{ display: "flex", gap: 8, alignItems: "flex-start", background: "rgba(178,58,46,0.08)", border: "1px solid rgba(178,58,46,0.2)", borderRadius: 8, padding: "10px 12px", marginBottom: 10 }}>
+                <AlertTriangle size={15} color="#B23A2E" style={{ flexShrink: 0, marginTop: 1 }} />
+                <span style={{ fontSize: 13, color: "#B23A2E" }}>{aiDraftError}</span>
+              </div>
+            )}
 
             <textarea style={styles.textArea} placeholder={isLeaseTemplate ? "Add specific lease terms (optional) — deposit amount, lease length, house rules…" : "Add specific details (optional) — reason, dates, performance notes…"}
               value={extra} onChange={(e) => setExtra(e.target.value)} rows={3} />
@@ -8770,25 +9234,37 @@ function DocumentsPanel({ biz, category, persist, setTab, canEditBranding = true
             </button>
           </>
         ) : (
-          <>
-            <p style={styles.helperText}>Write a short prompt describing what you need — who it's for, what it's about, any key details. AI writes the full letter; you just add your logo and signature above.</p>
-            <textarea style={styles.textArea} rows={4} placeholder='e.g. "A recommendation letter for Grace, who worked as our cashier for 2 years, always punctual and great with customers"'
+          <div style={{
+            background: "linear-gradient(135deg, rgba(20,73,176,0.06), rgba(20,73,176,0.02))",
+            border: "1px solid var(--line)", borderRadius: 12, padding: 16,
+          }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 8 }}>
+              <Sparkles size={16} color="var(--accent)" />
+              <div style={{ fontWeight: 700, fontSize: 14.5 }}>Describe what you need</div>
+            </div>
+            <p style={{ ...styles.helperText, marginTop: 0 }}>Who it's for, what it's about, any key details — AI writes the full letter. You just add your logo and signature above.</p>
+            <textarea style={{ ...styles.textArea, background: "var(--surface)" }} rows={4} placeholder='e.g. "A recommendation letter for Grace, who worked as our cashier for 2 years, always punctual and great with customers"'
               value={fullPrompt} onChange={(e) => setFullPrompt(e.target.value)} />
             <button style={{ ...styles.primaryBtnSmall, opacity: fullPrompt.trim() ? 1 : 0.5 }} disabled={!fullPrompt.trim() || fullDrafting} onClick={draftFullLetter}>
               <Sparkles size={16} /> {fullDrafting ? "Writing…" : "Generate with AI"}
             </button>
-            {fullDraftError && <div style={styles.authError}>{fullDraftError}</div>}
+            {fullDraftError && (
+              <div style={{ display: "flex", gap: 8, alignItems: "flex-start", background: "rgba(178,58,46,0.08)", border: "1px solid rgba(178,58,46,0.2)", borderRadius: 8, padding: "10px 12px", marginTop: 10 }}>
+                <AlertTriangle size={15} color="#B23A2E" style={{ flexShrink: 0, marginTop: 1 }} />
+                <span style={{ fontSize: 13, color: "#B23A2E" }}>{fullDraftError}</span>
+              </div>
+            )}
 
             {fullDraftText && (
               <>
                 <div style={{ ...styles.miniLabel, marginTop: 14 }}>Review and edit before saving</div>
-                <textarea style={{ ...styles.textArea, minHeight: 160 }} value={fullDraftText} onChange={(e) => setFullDraftText(e.target.value)} rows={8} />
+                <textarea style={{ ...styles.textArea, minHeight: 160, background: "var(--surface)" }} value={fullDraftText} onChange={(e) => setFullDraftText(e.target.value)} rows={8} />
                 <button style={styles.primaryBtnSmall} onClick={generateFromPrompt}>
                   <Check size={16} /> Use this letter
                 </button>
               </>
             )}
-          </>
+          </div>
         )}
       </div>
 
@@ -9261,6 +9737,7 @@ function MorePanel({ isOwner, isManager, currentEmployee, category, setTab }) {
       rows: [
         { id: "quotes", label: "Quotes & Estimates", icon: ClipboardList, desc: "Give a formal price before a sale, then convert it once accepted", show: true },
         { id: "reminders", label: "Reminders", icon: MessageCircle, desc: "Today's follow-ups — appointments to confirm, payments to chase", show: true },
+        { id: "messages", label: "Messages", icon: Send, desc: "Direct chat with your staff, one thread per person", show: true },
         { id: "calendar", label: "Calendar", icon: CalendarClock, desc: category.id === "property" ? "Rent due-dates, paid vs overdue, month by month" : `Your ${category.orderNounPlural.toLowerCase()} laid out day by day`, show: true },
         { id: "customers", label: category.customerNounPlural, icon: Users, desc: `Everyone who's had ${article(category.orderNoun)} ${category.orderNoun.toLowerCase()} with you`, show: true },
         { id: "calculator", label: "Price calculator", icon: Calculator, desc: "Work out tax & discount, set defaults", show: true },
@@ -9364,7 +9841,7 @@ function BottomNav({ tab, setTab, isOwner, unread, category }) {
     { id: "more", label: "More", icon: MoreHorizontal },
   ];
   const activeSet = {
-    more: ["more", "employees", "branches", "customers", "reports", "accounting", "marketing", "documents", "billing", "settings", "calculator", "expenses", "activity", "integrations", "help", "quotes", "calendar", "reminders", "suppliers", "businesses", "budget", "purchaseOrders"],
+    more: ["more", "employees", "branches", "customers", "reports", "accounting", "marketing", "documents", "billing", "settings", "calculator", "expenses", "activity", "integrations", "help", "quotes", "calendar", "reminders", "messages", "suppliers", "businesses", "budget", "purchaseOrders"],
   };
   return (
     <div style={styles.bottomNav} className="app-bottom-nav">
