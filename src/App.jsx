@@ -979,6 +979,30 @@ export default function App() {
   const [authMode, setAuthMode] = useState("landing"); // landing | login | register
   const [session, setSession] = useState(null); // employee id currently "logged in"
   const [tab, setTab] = useState("overview");
+  const [unreadMessages, setUnreadMessages] = useState(0);
+
+  // Lives up here (not after the early returns below) because hooks must run on
+  // every render regardless of login state — it safely no-ops until biz/session
+  // are actually loaded.
+  useEffect(() => {
+    const businessRowId = biz?.profile?.businessRowId;
+    const me = biz?.employees?.find((e) => e.id === session) || biz?.employees?.[0];
+    if (!businessRowId || !me) { setUnreadMessages(0); return; }
+    const amOwner = me.role === "owner";
+    let cancelled = false;
+    const computeAndSet = async () => {
+      let query = supabase.from("chat_messages").select("id, thread_employee_id, sender_employee_id, read_at").eq("business_id", businessRowId);
+      if (!amOwner) query = query.eq("thread_employee_id", me.id);
+      const { data } = await query;
+      if (cancelled || !data) return;
+      setUnreadMessages(data.filter((m) => m.sender_employee_id !== me.id && !m.read_at).length);
+    };
+    computeAndSet();
+    const channel = supabase.channel(`unread-badge-${businessRowId}`)
+      .on("postgres_changes", { event: "*", schema: "public", table: "chat_messages", filter: `business_id=eq.${businessRowId}` }, computeAndSet)
+      .subscribe();
+    return () => { cancelled = true; supabase.removeChannel(channel); };
+  }, [biz?.profile?.businessRowId, biz?.employees, session]);
   const [myBusinesses, setMyBusinesses] = useState([]); // every business this login can access
   const [switchingBusiness, setSwitchingBusiness] = useState(false);
   const [isOnline, setIsOnline] = useState(typeof navigator === "undefined" ? true : navigator.onLine);
@@ -1337,25 +1361,6 @@ export default function App() {
   };
 
   const canSee = (moduleId) => isOwner || isManager || hasModuleAccess(currentEmployee, moduleId);
-
-  const [unreadMessages, setUnreadMessages] = useState(0);
-  useEffect(() => {
-    const businessRowId = biz.profile?.businessRowId;
-    if (!businessRowId || !currentEmployee) return;
-    let cancelled = false;
-    const computeAndSet = async () => {
-      let query = supabase.from("chat_messages").select("id, thread_employee_id, sender_employee_id, read_at").eq("business_id", businessRowId);
-      if (!isOwner) query = query.eq("thread_employee_id", currentEmployee.id);
-      const { data } = await query;
-      if (cancelled || !data) return;
-      setUnreadMessages(data.filter((m) => m.sender_employee_id !== currentEmployee.id && !m.read_at).length);
-    };
-    computeAndSet();
-    const channel = supabase.channel(`unread-badge-${businessRowId}`)
-      .on("postgres_changes", { event: "*", schema: "public", table: "chat_messages", filter: `business_id=eq.${businessRowId}` }, computeAndSet)
-      .subscribe();
-    return () => { cancelled = true; supabase.removeChannel(channel); };
-  }, [biz.profile?.businessRowId, currentEmployee?.id, isOwner]);
 
   return (
     <div style={{ ...styles.appShell, ...themeVars }} className="app-shell">
